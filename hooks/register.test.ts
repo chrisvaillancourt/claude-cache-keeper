@@ -16,10 +16,14 @@ const HIT: ModelUsage = {
 const MISS: ModelUsage = { ...HIT, cache_read_input_tokens: 0, cache_creation_input_tokens: 200_000 }
 
 /** The world beneath the plugin: clock, env, files, session figures and the fork. */
-const world = (on: On, opts: { usage?: ModelUsage; contextTokens?: number; percentUsed?: number } = {}) => {
+const world = (
+  on: On,
+  opts: { usage?: ModelUsage; contextTokens?: number; percentUsed?: number; store?: Record<string, unknown> } = {},
+) => {
   const clock = mock.clock(on, { now: T0 })
   mock.env(on, { HOME: '/home/t' })
-  mock.store(on)
+  mock.store(on, opts.store ?? {})
+  on('session.version', () => ({ value: { version: '2.1.292', base: '2.1.292', builtAt: '2026-10-01' } }))
 
   const files = new Map<string, string>()
   on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
@@ -134,6 +138,34 @@ describe('cache-keeper', () => {
     expect(w.forks.length).toBe(1)
     expect(w.logLines().map(l => l.kind)).toEqual(['ping', 'stop'])
     expect(w.logLines()[1]).toEqual(expect.objectContaining({ reason: 'cache-miss' }))
+  })
+
+  test('a fork miss benches pinging for this Claude Code version, across sessions', async ($, on) => {
+    const w = world(on, { usage: MISS })
+    await startAndTurn($)
+    await w.clock.advance(1 * HOUR)
+    expect(w.forks.length).toBe(1)
+
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    await $.turn.complete({ answer: 'done', durationMs: 1000, isAborted: false, turnId: 't2', reason: 'answer' })
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(1)
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'stop', reason: 'fork-miss-on-this-version' }))
+  })
+
+  test('a recorded miss on this version stops pings before they are sent', async ($, on) => {
+    const w = world(on, { store: { forkMiss: { version: '2.1.292', at: 0 } } })
+    await startAndTurn($)
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'stop', reason: 'fork-miss-on-this-version' }))
+  })
+
+  test('a miss recorded on an older version does not bench a new one', async ($, on) => {
+    const w = world(on, { store: { forkMiss: { version: '2.1.291', at: 0 } } })
+    await startAndTurn($)
+    await w.clock.advance(56 * MIN)
+    expect(w.forks.length).toBe(1)
   })
 
   test('small contexts are left alone', async ($, on) => {

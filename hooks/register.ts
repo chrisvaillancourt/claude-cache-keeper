@@ -86,6 +86,16 @@ async function stop($: EngineInterface, reason: string, extra: Record<string, un
   $.ui.status(reason === 'off' ? undefined : `cache-keeper: stopped (${reason})`)
 }
 
+/**
+ * A fork that missed the cache (anthropics/claude-code#100083) costs about a
+ * full re-cache, so one miss benches automatic pings, in every session, until
+ * Claude Code's version changes. A manual `/keepwarm now` hit lifts it.
+ */
+async function isBenched($: EngineInterface) {
+  const miss = (await $.store.get('forkMiss')) as { version?: string } | undefined
+  return miss?.version !== undefined && miss.version === (await $.session.version()).version
+}
+
 async function ping($: EngineInterface): Promise<PingRecord> {
   isPinging = true
   try {
@@ -120,6 +130,16 @@ async function ping($: EngineInterface): Promise<PingRecord> {
       costBefore: before.cost?.usd ?? null,
       costAfter: after.cost?.usd ?? null,
     })
+    if (outcome === 'miss') {
+      await $.store.set('forkMiss', {
+        version: (await $.session.version()).version,
+        at: now,
+        cacheRead: record.cacheRead,
+        cacheWrite: record.cacheWrite,
+      })
+    } else if (outcome === 'hit') {
+      await $.store.delete('forkMiss')
+    }
     if (outcome === 'hit') {
       $.ui.toast(`cache-keeper: kept ${kTokens(record.cacheRead)} cached (ping ${s.pings})`)
     } else {
@@ -153,6 +173,10 @@ async function schedule($: EngineInterface): Promise<void> {
       await stop($, d.reason)
       return
     case 'ping':
+      if (await isBenched($)) {
+        await stop($, 'fork-miss-on-this-version')
+        return
+      }
       if ((await ping($)).outcome === 'hit') await schedule($)
       return
   }

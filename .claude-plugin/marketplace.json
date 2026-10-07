@@ -1,5 +1,13 @@
 {
   "name": "cache-keeper",
-  "owner": { "name": "Chris Vaillancourt" },
-  "plugins": [{ "name": "cache-keeper", "source": "./" }]
+  "owner": {
+    "name": "Chris Vaillancourt"
+  },
+  "plugins": [
+    {
+      "name": "cache-keeper",
+      "source": "./"
+    }
+  ],
+  "description": "Keeps an idle Claude Code session's prompt cache warm."
 }

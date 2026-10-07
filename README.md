@@ -22,14 +22,16 @@ On Opus 5.5, one cache read costs about 1/35–1/40 as much as re-caching the sa
 
 `/keepwarm [status | on | off | auto | now | for 3h | until 18:00]`
 
-## Install (local folder marketplace)
+## Install
 
 ```sh
-claude plugin marketplace add ~/dev/github/chrisvaillancourt/claude-cache-keeper
+claude plugin marketplace add chrisvaillancourt/claude-cache-keeper
 claude plugin install cache-keeper@cache-keeper --scope user
 ```
 
-The plugin is read from this folder. After editing, run `/reload-plugins`.
+Or from inside Claude Code: `/plugin install cache-keeper --marketplace chrisvaillancourt/claude-cache-keeper`.
+
+To work on it locally, add your clone as the marketplace instead (`claude plugin marketplace add <path to clone>`). The plugin is read from that folder; after editing, run `/reload-plugins`.
 
 ## Develop
 

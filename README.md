@@ -41,6 +41,8 @@ claude plugin validate .
 claude plugin test .
 ```
 
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, ...).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

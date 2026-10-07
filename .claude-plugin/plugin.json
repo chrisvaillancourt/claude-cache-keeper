@@ -1,6 +1,6 @@
 {
   "name": "cache-keeper",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keeps an idle session's prompt cache warm with a cache-served fork just before the TTL lapses, within limits you set.",
   "types": "./types/index.d.ts",
   "userConfig": {

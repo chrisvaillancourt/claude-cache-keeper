@@ -6,11 +6,12 @@ On Opus 5.5, one cache read costs about 1/35–1/40 as much as re-caching the sa
 
 ## Behavior
 
-- Arms a timer after each main-loop turn; subagent turns are ignored.
+- Keeps only the main conversation's cache warm. A ping (`$.model.fork`) always replays the main thread's last request, and subagent turns don't arm or reset the timer, so an idle subagent's cache is never pinged and just expires.
+- Arms a timer after each main-loop turn.
 - Pings at `ttlMinutes − leadMinutes` (60 − 5).
 - Stops when:
   - the cache has already expired (e.g. the machine slept);
-  - you've been idle longer than `maxIdleHours` (8), unless `/keepwarm for|until` set a window;
+  - you've been idle longer than `maxIdleHours` (8), unless `/keepwarm for|until` set a window. The window restarts on any main-loop turn, including ones you didn't type: a background agent's result arriving, a `/loop` wakeup. That's intended, because those turns use the main cache too;
   - the context is under `minContextTokens` (60k);
   - five-hour or weekly usage is at or above `maxLimitPercent` (85);
   - a ping misses the cache. A miss also benches automatic pings in every session until Claude Code's version changes, because forks can miss the conversation cache (anthropics/claude-code#100083) and a missed ping costs about a full re-cache. A `/keepwarm now` hit lifts the bench.

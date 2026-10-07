@@ -34,6 +34,8 @@ export const decide = (s: Session, now: number, facts: Facts, config: Config): D
   const pingAt = expiresAt - config.leadMs
   if (now < pingAt) return { action: 'wait', at: pingAt }
 
+  // lastTurnAt moves on every main-loop turn, typed or not (a background
+  // agent's result, a /loop wakeup): those extend the idle window by design.
   const keepUntil = s.untilMs ?? (s.lastTurnAt ?? s.lastRequestAt) + config.maxIdleMs
   if (now > keepUntil) return { action: 'stop', reason: 'idle-limit' }
   if (facts.contextTokens < config.minContextTokens) return { action: 'stop', reason: 'small-context' }

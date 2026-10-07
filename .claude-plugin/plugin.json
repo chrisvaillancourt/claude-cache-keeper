@@ -43,5 +43,6 @@
   },
   "author": {
     "name": "Chris Vaillancourt"
-  }
+  },
+  "license": "MIT"
 }

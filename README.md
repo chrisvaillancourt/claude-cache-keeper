@@ -39,3 +39,7 @@ To work on it locally, add your clone as the marketplace instead (`claude plugin
 claude plugin validate .
 claude plugin test .
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

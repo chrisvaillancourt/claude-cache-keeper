@@ -1,0 +1,47 @@
+{
+  "name": "cache-keeper",
+  "version": "0.1.0",
+  "description": "Keeps an idle session's prompt cache warm with a cache-served fork just before the TTL lapses, within limits you set.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Keep caches warm",
+      "description": "Ping idle sessions before their prompt cache expires. /keepwarm on|off overrides per session.",
+      "default": true
+    },
+    "ttlMinutes": {
+      "type": "number",
+      "title": "Cache TTL (minutes)",
+      "description": "Prompt-cache lifetime of the main conversation: 60 on a subscription within plan usage.",
+      "default": 60
+    },
+    "leadMinutes": {
+      "type": "number",
+      "title": "Ping lead (minutes)",
+      "description": "How long before the cache would expire to ping.",
+      "default": 5
+    },
+    "maxIdleHours": {
+      "type": "number",
+      "title": "Keep warm for (hours)",
+      "description": "Stop pinging this long after your last real turn, unless /keepwarm until or for says otherwise. A ping costs about 1/35 of a 1h re-cache on Opus 5.5, so 8 hours of pings (~9) cost about a quarter of one rewrite.",
+      "default": 8
+    },
+    "minContextTokens": {
+      "type": "number",
+      "title": "Minimum context (tokens)",
+      "description": "Skip sessions whose context is smaller than this; they are cheap to re-cache.",
+      "default": 60000
+    },
+    "maxLimitPercent": {
+      "type": "number",
+      "title": "Usage ceiling (%)",
+      "description": "Stop pinging when the five-hour or weekly plan usage reaches this percentage.",
+      "default": 85
+    }
+  },
+  "author": {
+    "name": "Chris Vaillancourt"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "cache-keeper",
+  "owner": { "name": "Chris Vaillancourt" },
+  "plugins": [{ "name": "cache-keeper", "source": "./" }]
+}

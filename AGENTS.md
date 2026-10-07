@@ -31,6 +31,6 @@ Both must pass before every commit. Behavior changes need a test in `hooks/*.tes
 ## Conventions
 
 - Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`).
-- Bump `version` in `plugin.json` for a release. Installs from GitHub run a copy and only update when the version changes. An install whose marketplace is a local clone runs from the clone itself: edit, then `/reload-plugins` (`claude plugin list` shows `Read from: <clone>`). Ignore the stale copy under `~/.claude/plugins/cache/`.
+- Bump `version` in `plugin.json` for every release users should get. Installs from GitHub run a copy, and `claude plugin update` only replaces it when the version changes: a pushed commit without a bump is reported as "already at the latest version" and never reaches them (tested on Claude Code 2.1.292). An install whose marketplace is a local clone runs from the clone itself: edit, then `/reload-plugins` (`claude plugin list` shows `Read from: <clone>`). Ignore the stale copy under `~/.claude/plugins/cache/`.
 - This repo is public: no secrets, tokens, session IDs, personal paths or employer-specific details in code, tests, docs or commit messages.
 - Don't add Claude or AI attribution trailers to commits.

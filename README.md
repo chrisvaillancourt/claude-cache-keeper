@@ -34,6 +34,19 @@ Or from inside Claude Code: `/plugin install cache-keeper --marketplace chrisvai
 
 To work on it locally, add your clone as the marketplace instead (`claude plugin marketplace add <path to clone>`). The plugin is read from that folder; after editing, run `/reload-plugins`.
 
+## Update
+
+```sh
+claude plugin update cache-keeper@cache-keeper
+```
+
+Then restart Claude Code. If it says the plugin is already at the latest version but a newer release exists, refresh the marketplace first and run the update again:
+
+```sh
+claude plugin marketplace update cache-keeper
+claude plugin update cache-keeper@cache-keeper
+```
+
 ## Develop
 
 ```sh

@@ -24,6 +24,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   pings: 0,
   lastPing: null,
   stopReason: null,
+  probe: null,
   ...over,
 })
 

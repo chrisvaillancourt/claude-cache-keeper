@@ -31,6 +31,8 @@ export type Session = {
   pings: number
   lastPing: PingRecord | null
   stopReason: string | null
+  /** Set at the start of a real turn that follows a pinged break longer than the TTL. */
+  probe: { contextTokens: number; idleMinutes: number; pings: number } | null
 }
 
 declare module 'claude-code' {

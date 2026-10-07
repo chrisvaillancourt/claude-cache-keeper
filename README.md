@@ -14,6 +14,7 @@ On Opus 5.5, one cache read costs about 1/35–1/40 as much as re-caching the sa
   - the context is under `minContextTokens` (60k);
   - five-hour or weekly usage is at or above `maxLimitPercent` (85);
   - a ping misses the cache. A miss also benches automatic pings in every session until Claude Code's version changes, because forks can miss the conversation cache (anthropics/claude-code#100083) and a missed ping costs about a full re-cache. A `/keepwarm now` hit lifts the bench.
+- Checks itself: the first real turn after a pinged break longer than the TTL should read the context from cache. If it re-writes most of it, the pings didn't extend the main cache entry, and automatic pings are benched for that Claude Code version (log `kind: verify`).
 - Skips headless sessions (`-p`, SDK).
 - Logs every ping to `~/.claude/cache-keeper/<session-id>.jsonl`: token usage, plan-usage percentage before and after, and API-equivalent cost before and after.
 

@@ -168,6 +168,39 @@ describe('cache-keeper', () => {
     expect(w.forks.length).toBe(1)
   })
 
+  test('a real turn after a pinged idle hour checks that the ping kept the cache warm', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(70 * MIN) // ping at 55; the turn comes 70 minutes after the last real one
+    expect(w.forks.length).toBe(1)
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    const usage = { ...HIT, cache_creation_input_tokens: 3_000, model: 'claude-opus-5-5' }
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer', usage })
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'verify', verdict: 'warm', idleMinutes: 70 }))
+  })
+
+  test('a cold turn after pings benches automatic pings for this version', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(70 * MIN)
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    const usage = { ...HIT, cache_read_input_tokens: 20_000, cache_creation_input_tokens: 190_000, model: 'claude-opus-5-5' }
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer', usage })
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'verify', verdict: 'cold' }))
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(1)
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'stop', reason: 'fork-miss-on-this-version' }))
+  })
+
+  test('no verify record without an idle hour', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(57 * MIN)
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer', usage: { ...HIT, model: 'm' } })
+    expect(w.logLines().map(l => l.kind)).toEqual(['ping'])
+  })
+
   test('small contexts are left alone', async ($, on) => {
     const w = world(on, { contextTokens: 5_000 })
     await startAndTurn($)

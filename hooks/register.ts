@@ -19,6 +19,7 @@ const INITIAL: Session = {
   pings: 0,
   lastPing: null,
   stopReason: null,
+  probe: null,
 }
 
 const sessionAtom = atom({ plugin: 'cache-keeper', key: 'session' } as const, INITIAL)
@@ -88,12 +89,39 @@ async function stop($: EngineInterface, reason: string, extra: Record<string, un
 
 /**
  * A fork that missed the cache (anthropics/claude-code#100083) costs about a
- * full re-cache, so one miss benches automatic pings, in every session, until
- * Claude Code's version changes. A manual `/keepwarm now` hit lifts it.
+ * full re-cache, and a fork that hit but didn't extend the main entry's TTL
+ * buys nothing. Either benches automatic pings, in every session, until
+ * Claude Code's version changes. A manual `/keepwarm now` hit lifts a miss.
  */
 async function isBenched($: EngineInterface) {
+  const version = (await $.session.version()).version
   const miss = (await $.store.get('forkMiss')) as { version?: string } | undefined
-  return miss?.version !== undefined && miss.version === (await $.session.version()).version
+  const refreshFail = (await $.store.get('refreshFail')) as { version?: string } | undefined
+  return miss?.version === version || refreshFail?.version === version
+}
+
+/**
+ * Judges the first real turn after a pinged break longer than the TTL: had the
+ * pings not refreshed the main entry, that turn re-writes most of the context.
+ */
+async function verifyRefresh($: EngineInterface, probe: NonNullable<Session['probe']>, usage: ModelUsage) {
+  const verdict = usage.cache_creation_input_tokens < 0.5 * probe.contextTokens ? 'warm' : 'cold'
+  const version = (await $.session.version()).version
+  await appendLog($, {
+    kind: 'verify',
+    verdict,
+    ...probe,
+    cacheRead: usage.cache_read_input_tokens,
+    cacheWrite: usage.cache_creation_input_tokens,
+    version,
+  })
+  const at = await $.clock.now()
+  if (verdict === 'cold') {
+    await $.store.set('refreshFail', { version, at })
+    $.ui.toast('cache-keeper: pings did not keep the cache warm on this version; automatic pings paused')
+  } else {
+    await $.store.set('refreshVerified', { version, at })
+  }
 }
 
 async function ping($: EngineInterface): Promise<PingRecord> {
@@ -222,7 +250,22 @@ export const register: Register = (on, options) => {
 
   on('turn.start', async ($, e, next) => {
     cancelTimer()
-    await update($, sessionAtom, s => ({ ...s, isTurnRunning: true }))
+    const now = await $.clock.now()
+    const s = await read($, sessionAtom)
+    const isProbe =
+      s.pings > 0 &&
+      s.lastTurnAt !== null &&
+      s.lastRequestAt !== null &&
+      now - s.lastTurnAt > config.ttlMs &&
+      now - s.lastRequestAt < config.ttlMs
+    const probe = isProbe
+      ? {
+          contextTokens: (await $.session.usage()).context.tokens ?? 0,
+          idleMinutes: Math.round((now - (s.lastTurnAt ?? now)) / MIN),
+          pings: s.pings,
+        }
+      : null
+    await update($, sessionAtom, cur => ({ ...cur, isTurnRunning: true, probe }))
     return next(e)
   })
 
@@ -230,8 +273,11 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (e.agentId !== undefined || isPinging) return result
     const now = await $.clock.now()
+    const { probe } = await read($, sessionAtom)
+    if (probe && e.usage !== undefined) await verifyRefresh($, probe, e.usage)
     await update($, sessionAtom, s => ({
       ...s,
+      probe: null,
       isTurnRunning: false,
       lastRequestAt: now,
       lastTurnAt: now,

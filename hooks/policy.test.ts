@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { classifyPing, decide, parseKeepwarmArgs } from './policy'
+import { classifyPing, decide, parseKeepwarmArgs, retryAt } from './policy'
 import type { Config, Session } from '../types'
 
 const MIN = 60_000
@@ -21,7 +21,11 @@ const session = (over: Partial<Session> = {}): Session => ({
   lastRequestAt: 0,
   lastTurnAt: 0,
   isTurnRunning: false,
+  turnId: null,
+  cacheTtl: null,
+  isCompacted: false,
   pings: 0,
+  pingErrors: 0,
   lastPing: null,
   stopReason: null,
   probe: null,
@@ -59,6 +63,29 @@ describe('decide', () => {
   test('an explicit until overrides the idle limit', () => {
     const s = session({ lastRequestAt: 4 * HOUR, untilMs: 9 * HOUR })
     expect(decide(s, 4 * HOUR + 56 * MIN, facts, config)).toEqual({ action: 'ping' })
+  })
+
+  test('an until window that has passed falls back to the idle limit', () => {
+    const s = session({ lastRequestAt: 10 * HOUR, lastTurnAt: 10 * HOUR, untilMs: 2 * HOUR })
+    expect(decide(s, 10 * HOUR + 56 * MIN, facts, config)).toEqual({ action: 'ping' })
+  })
+
+  test('an until window never shortens the idle limit', () => {
+    expect(decide(session({ untilMs: 30 * MIN }), 56 * MIN, facts, config)).toEqual({ action: 'ping' })
+  })
+
+  test('an until window keeps warm while the mode is off, and only until it ends', () => {
+    const s = session({ mode: 'off', untilMs: 2 * HOUR })
+    expect(decide(s, 56 * MIN, facts, config)).toEqual({ action: 'ping' })
+    expect(decide({ ...s, lastRequestAt: 2 * HOUR }, 2 * HOUR + 56 * MIN, facts, config)).toEqual({
+      action: 'stop',
+      reason: 'off',
+    })
+  })
+
+  test('stops when the engine reports a five-minute cache TTL', () => {
+    expect(decide(session({ cacheTtl: '5m' }), 56 * MIN, facts, config)).toEqual({ action: 'stop', reason: 'short-ttl' })
+    expect(decide(session({ cacheTtl: '1h' }), 56 * MIN, facts, config)).toEqual({ action: 'ping' })
   })
 
   test('off mode and disabled config stop', () => {
@@ -101,6 +128,17 @@ describe('decide', () => {
     expect(decide(session({ lastRequestAt: null, lastTurnAt: null }), 56 * MIN, facts, config)).toEqual({
       action: 'idle',
     })
+  })
+})
+
+describe('retryAt', () => {
+  test('two minutes after a failed ping', () => {
+    expect(retryAt(session(), 55 * MIN, config)).toBe(57 * MIN)
+  })
+
+  test('sooner when the cache would lapse first, and not at all when it nearly has', () => {
+    expect(retryAt(session(), 59 * MIN, config)).toBe(59 * MIN + 30_000)
+    expect(retryAt(session(), 59 * MIN + 45_000, config)).toBe(null)
   })
 })
 

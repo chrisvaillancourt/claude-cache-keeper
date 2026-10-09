@@ -1,6 +1,6 @@
 {
   "name": "cache-keeper",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keeps an idle session's prompt cache warm with a cache-served fork just before the TTL lapses, within limits you set.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -25,7 +25,7 @@
     "maxIdleHours": {
       "type": "number",
       "title": "Keep warm for (hours)",
-      "description": "Stop pinging this long after your last real turn, unless /keepwarm until or for says otherwise. A ping costs about 1/35 of a 1h re-cache on Opus 5.5, so 8 hours of pings (~9) cost about a quarter of one rewrite.",
+      "description": "Stop pinging this long after your last real turn; /keepwarm for or until can extend it. A ping costs about 1/35 of a 1h re-cache on Opus 5.5, so 8 hours of pings (~9) cost about a quarter of one rewrite.",
       "default": 8
     },
     "minContextTokens": {
@@ -37,8 +37,8 @@
     "maxLimitPercent": {
       "type": "number",
       "title": "Usage ceiling (%)",
-      "description": "Stop pinging when the five-hour or weekly plan usage reaches this percentage.",
-      "default": 85
+      "description": "Stop pinging when the five-hour or weekly plan usage reaches this percentage. A ping uses far less than the re-cache it saves, so only stop close to the cap.",
+      "default": 95
     }
   },
   "author": {

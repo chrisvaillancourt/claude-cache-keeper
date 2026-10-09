@@ -11,7 +11,7 @@ export type Facts = {
   limits: readonly Pick<SessionRateLimit, 'kind' | 'percentUsed'>[]
 }
 
-export type StopReason = 'off' | 'expired' | 'idle-limit' | 'small-context' | 'near-limit'
+export type StopReason = 'off' | 'expired' | 'short-ttl' | 'idle-limit' | 'small-context' | 'near-limit'
 
 export type Decision =
   | { action: 'idle' }
@@ -24,9 +24,12 @@ export type Decision =
  * the session's state, the context size and plan usage, and the config.
  */
 export const decide = (s: Session, now: number, facts: Facts, config: Config): Decision => {
-  const isOn = s.mode === 'on' || (s.mode === 'auto' && config.enabled)
+  const isInWindow = s.untilMs !== null && now <= s.untilMs
+  const isOn = isInWindow || s.mode === 'on' || (s.mode === 'auto' && config.enabled)
   if (!isOn) return { action: 'stop', reason: 'off' }
-  if (s.isTurnRunning || s.lastRequestAt === null) return { action: 'idle' }
+  if (s.isTurnRunning || s.lastRequestAt === null || s.isCompacted) return { action: 'idle' }
+  // A five-minute cache needs a ping every few minutes: within the hour that costs more than a re-cache.
+  if (s.cacheTtl === '5m') return { action: 'stop', reason: 'short-ttl' }
 
   const expiresAt = s.lastRequestAt + config.ttlMs
   if (now >= expiresAt) return { action: 'stop', reason: 'expired' }
@@ -36,7 +39,8 @@ export const decide = (s: Session, now: number, facts: Facts, config: Config): D
 
   // lastTurnAt moves on every main-loop turn, typed or not (a background
   // agent's result, a /loop wakeup): those extend the idle window by design.
-  const keepUntil = s.untilMs ?? (s.lastTurnAt ?? s.lastRequestAt) + config.maxIdleMs
+  // A /keepwarm for|until window extends that, never shortens it.
+  const keepUntil = Math.max(s.untilMs ?? 0, (s.lastTurnAt ?? s.lastRequestAt) + config.maxIdleMs)
   if (now > keepUntil) return { action: 'stop', reason: 'idle-limit' }
   if (facts.contextTokens < config.minContextTokens) return { action: 'stop', reason: 'small-context' }
   if (facts.limits.some(l => l.percentUsed >= config.maxLimitPercent)) {
@@ -44,6 +48,20 @@ export const decide = (s: Session, now: number, facts: Facts, config: Config): D
   }
 
   return { action: 'ping' }
+}
+
+const RETRY_MS = 2 * MIN
+const RETRY_MARGIN_MS = 30_000
+
+/**
+ * When to retry a failed ping: two minutes on, or halfway to expiry when the
+ * cache would lapse first; null when too little of it is left.
+ */
+export const retryAt = (s: Session, now: number, config: Config): number | null => {
+  if (s.lastRequestAt === null) return null
+  const expiresAt = s.lastRequestAt + config.ttlMs
+  const at = Math.min(now + RETRY_MS, now + (expiresAt - now) / 2)
+  return expiresAt - at >= RETRY_MARGIN_MS ? at : null
 }
 
 /** A fork the cache served at least 80% of is a hit; otherwise it paid for the prefix. */

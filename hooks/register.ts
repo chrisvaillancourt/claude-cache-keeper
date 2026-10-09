@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, PluginOptions, Register, SessionUsage, Timer } from 'claude-code'
 
-import { classifyPing, decide, parseKeepwarmArgs } from './policy'
+import { classifyPing, decide, parseKeepwarmArgs, retryAt } from './policy'
 import type { Config, PingRecord, Session } from '../types'
 
 const MIN = 60_000
@@ -16,7 +16,11 @@ const INITIAL: Session = {
   lastRequestAt: null,
   lastTurnAt: null,
   isTurnRunning: false,
+  turnId: null,
+  cacheTtl: null,
+  isCompacted: false,
   pings: 0,
+  pingErrors: 0,
   lastPing: null,
   stopReason: null,
   probe: null,
@@ -42,7 +46,7 @@ function configFrom(options: PluginOptions): Config {
     leadMs: num(options.leadMinutes, 5) * MIN,
     maxIdleMs: num(options.maxIdleHours, 8) * HOUR,
     minContextTokens: num(options.minContextTokens, 60_000),
-    maxLimitPercent: num(options.maxLimitPercent, 85),
+    maxLimitPercent: num(options.maxLimitPercent, 95),
   }
 }
 
@@ -78,11 +82,31 @@ async function appendLog($: EngineInterface, record: Record<string, unknown>) {
   }
 }
 
+/** What a stop line needs to be audited later: context, plan usage, model and version. */
+async function logContext($: EngineInterface) {
+  try {
+    const usage = await $.session.usage()
+    return {
+      contextTokens: usage.context.tokens ?? null,
+      limits: limitsOf(usage),
+      model: await $.session.model(),
+      version: (await $.session.version()).version,
+    }
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Logs a stop when its reason differs from the current one, so a stop that
+ * holds across turns (off) logs once. A stop ends only when the keeper is
+ * active again: waiting for a ping, or after a hit.
+ */
 async function stop($: EngineInterface, reason: string, extra: Record<string, unknown> = {}) {
   const s = await read($, sessionAtom)
   if (s.stopReason !== reason) {
     await update($, sessionAtom, cur => ({ ...cur, stopReason: reason }))
-    await appendLog($, { kind: 'stop', reason, pings: s.pings, ...extra })
+    await appendLog($, { kind: 'stop', reason, pings: s.pings, ...(await logContext($)), ...extra })
   }
   $.ui.status(reason === 'off' ? undefined : `cache-keeper: stopped (${reason})`)
 }
@@ -101,8 +125,10 @@ async function isBenched($: EngineInterface) {
 }
 
 /**
- * Judges the first real turn after a pinged break longer than the TTL: had the
- * pings not refreshed the main entry, that turn re-writes most of the context.
+ * Judges the first request of the first real turn after a pinged break longer
+ * than the TTL: had the pings not refreshed the main entry, it re-writes most
+ * of the context. Only the first request counts; later ones in the turn write
+ * what the turn added.
  */
 async function verifyRefresh($: EngineInterface, probe: NonNullable<Session['probe']>, usage: ModelUsage) {
   const verdict = usage.cache_creation_input_tokens < 0.5 * probe.contextTokens ? 'warm' : 'cold'
@@ -124,14 +150,22 @@ async function verifyRefresh($: EngineInterface, probe: NonNullable<Session['pro
   }
 }
 
-async function ping($: EngineInterface): Promise<PingRecord> {
+/** Pings once. A manual ping's error doesn't count toward the automatic retry. */
+async function ping($: EngineInterface, isManual = false): Promise<PingRecord> {
   isPinging = true
   try {
     const before = await $.session.usage()
     const result = await $.model.fork({ prompt: PING_PROMPT })
     const now = await $.clock.now()
     const after = await $.session.usage()
-    const usage: ModelUsage | undefined = 'usage' in result ? result.usage : undefined
+    // Usage that counted a prompt says whether the cache served the fork,
+    // whatever ended it. An api-error whose one request was refused carries
+    // all zeros: that's an error, not a miss.
+    const counted: ModelUsage | undefined = 'usage' in result ? result.usage : undefined
+    const prompt = counted
+      ? counted.cache_read_input_tokens + counted.cache_creation_input_tokens + counted.input_tokens
+      : 0
+    const usage = prompt > 0 ? counted : undefined
     const outcome = usage ? classifyPing(usage) : 'error'
     const record: PingRecord = {
       at: now,
@@ -145,6 +179,7 @@ async function ping($: EngineInterface): Promise<PingRecord> {
     const s = await update($, sessionAtom, cur => ({
       ...cur,
       lastPing: record,
+      pingErrors: outcome !== 'error' ? 0 : isManual ? cur.pingErrors : cur.pingErrors + 1,
       ...(outcome === 'hit' ? { lastRequestAt: now, pings: cur.pings + 1, stopReason: null } : {}),
     }))
     await appendLog($, {
@@ -168,11 +203,7 @@ async function ping($: EngineInterface): Promise<PingRecord> {
     } else if (outcome === 'hit') {
       await $.store.delete('forkMiss')
     }
-    if (outcome === 'hit') {
-      $.ui.toast(`cache-keeper: kept ${kTokens(record.cacheRead)} cached (ping ${s.pings})`)
-    } else {
-      await stop($, outcome === 'miss' ? 'cache-miss' : 'error', { detail: record.detail ?? null })
-    }
+    if (outcome === 'hit') $.ui.toast(`cache-keeper: kept ${kTokens(record.cacheRead)} cached (ping ${s.pings})`)
     return record
   } finally {
     isPinging = false
@@ -194,20 +225,35 @@ async function schedule($: EngineInterface): Promise<void> {
       $.ui.status(undefined)
       return
     case 'wait':
+      if (s.stopReason !== null) await update($, sessionAtom, cur => ({ ...cur, stopReason: null }))
       $.ui.status(`cache warm until ${hhmm(d.at + config.leadMs)} · keep-alive ${hhmm(d.at)}`)
       timer = $.clock.after(d.at - now, () => void schedule($))
       return
     case 'stop':
       await stop($, d.reason)
       return
-    case 'ping':
+    case 'ping': {
       if (await isBenched($)) {
         await stop($, 'fork-miss-on-this-version')
         return
       }
-      if ((await ping($)).outcome === 'hit') await schedule($)
+      const r = await ping($)
+      if (r.outcome === 'hit') return schedule($)
+      // One retry for a transient failure (an overloaded API, a dropped connection).
+      if (r.outcome === 'error' && (await read($, sessionAtom)).pingErrors < 2) return retryLater($, r)
+      await stop($, r.outcome === 'miss' ? 'cache-miss' : 'error', { detail: r.detail ?? null })
       return
+    }
   }
+}
+
+/** After a failed ping: tries again at retryAt, or stops when the cache would lapse first. */
+async function retryLater($: EngineInterface, r: PingRecord) {
+  const now = await $.clock.now()
+  const at = retryAt(await read($, sessionAtom), now, config)
+  if (at === null) return stop($, 'error', { detail: r.detail ?? null })
+  $.ui.status(`cache-keeper: ping failed, retrying at ${hhmm(at)}`)
+  timer = $.clock.after(at - now, () => void schedule($))
 }
 
 async function statusText($: EngineInterface) {
@@ -219,7 +265,7 @@ async function statusText($: EngineInterface) {
     parts.push(now < expiresAt ? `cache warm until ${hhmm(expiresAt)}` : `cache likely cold since ${hhmm(expiresAt)}`)
     if (timer !== null) parts.push(`next ping ${hhmm(expiresAt - config.leadMs)}`)
   }
-  if (s.untilMs !== null) parts.push(`keeping warm until ${hhmm(s.untilMs)}`)
+  if (s.untilMs !== null && s.untilMs > now) parts.push(`keeping warm until ${hhmm(s.untilMs)}`)
   parts.push(`${s.pings} ping${s.pings === 1 ? '' : 's'} since last turn`)
   if (s.lastPing) {
     parts.push(`last ping ${hhmm(s.lastPing.at)} ${s.lastPing.outcome} (${kTokens(s.lastPing.cacheRead)} cached)`)
@@ -243,7 +289,8 @@ export const register: Register = (on, options) => {
       description: 'Prompt-cache keep-alive: status, on, off, auto, now, for <n>h, until HH:MM',
       argumentHint: '[status|on|off|auto|now|for 3h|until 18:00]',
     })
-    await update($, sessionAtom, s => ({ ...s, isTurnRunning: false }))
+    // Spread over INITIAL so state saved by an older version gains the fields added since.
+    await update($, sessionAtom, s => ({ ...INITIAL, ...s, isTurnRunning: false, turnId: null }))
     await schedule($)
     return result
   })
@@ -254,6 +301,7 @@ export const register: Register = (on, options) => {
     const s = await read($, sessionAtom)
     const isProbe =
       s.pings > 0 &&
+      !s.isCompacted &&
       s.lastTurnAt !== null &&
       s.lastRequestAt !== null &&
       now - s.lastTurnAt > config.ttlMs &&
@@ -265,28 +313,77 @@ export const register: Register = (on, options) => {
           pings: s.pings,
         }
       : null
-    await update($, sessionAtom, cur => ({ ...cur, isTurnRunning: true, probe }))
+    await update($, sessionAtom, cur => ({ ...cur, isTurnRunning: true, turnId: e.turnId, probe }))
     return next(e)
+  })
+
+  on('turn.step', async function* ($, e, next) {
+    const result = yield* next(e)
+    if (e.agentId !== undefined) return result
+    try {
+      const s = await read($, sessionAtom)
+      if (s.turnId !== e.turnId) return result
+      if (s.isCompacted) await update($, sessionAtom, cur => ({ ...cur, isCompacted: false }))
+      if (e.index === 0 && s.probe !== null) {
+        await update($, sessionAtom, cur => ({ ...cur, probe: null }))
+        if (result.usage !== null) await verifyRefresh($, s.probe, result.usage)
+      }
+    } catch {
+      // The check is best effort; never fail the turn over it.
+    }
+    return result
   })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId !== undefined || isPinging) return result
+    if (e.agentId !== undefined) return result
+    // A ping's fork may raise a turn.complete of its own: while one runs, only
+    // the main turn whose start this module saw counts.
+    const { turnId } = await read($, sessionAtom)
+    if (isPinging && e.turnId !== turnId) return result
     const now = await $.clock.now()
-    const { probe } = await read($, sessionAtom)
-    if (probe && e.usage !== undefined) await verifyRefresh($, probe, e.usage)
     await update($, sessionAtom, s => ({
       ...s,
       probe: null,
       isTurnRunning: false,
+      turnId: null,
       lastRequestAt: now,
       lastTurnAt: now,
       pings: 0,
-      stopReason: null,
+      pingErrors: 0,
+      untilMs: s.untilMs !== null && s.untilMs <= now ? null : s.untilMs,
     }))
     await schedule($)
     return result
   })
+
+  // A compaction replaces the conversation: the next request shares no cached
+  // prefix with the last one, so there is nothing to keep warm, and its first
+  // request can't show whether pings worked. A precompute installs nothing.
+  // This hook and the next only observe: on a failure, `.catch` lets the event
+  // go on as it settled.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined || e.trigger === 'precompute' || result.messages === undefined) return result
+    await update($, sessionAtom, s => ({ ...s, isCompacted: true, probe: null }))
+    await schedule($)
+    return result
+  }).catch(($, e, next) => next(e))
+
+  // A new model has no cache entry until its first request, and a fork before
+  // then would miss and bench pings. The engine also says the cache's TTL here.
+  on('classic.PostModelSwitch', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agent_id !== undefined) return result
+    const isNewModel = e.from_model !== e.to_model
+    await update($, sessionAtom, s => ({
+      ...s,
+      cacheTtl: e.cache_ttl,
+      ...(isNewModel ? { lastRequestAt: null, probe: null } : {}),
+    }))
+    await schedule($)
+    return result
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'keepwarm' }, async ($, e) => {
     const cmd = parseKeepwarmArgs(e.args, await $.clock.now(), new Date().getTimezoneOffset())
@@ -296,17 +393,27 @@ export const register: Register = (on, options) => {
       case 'status':
         return { text: await statusText($) }
       case 'mode':
-        await update($, sessionAtom, s => ({ ...s, mode: cmd.mode, stopReason: null }))
+        await update($, sessionAtom, s => ({ ...s, mode: cmd.mode, untilMs: null }))
         await schedule($)
         return { text: `Keep-warm ${cmd.mode}. ${await statusText($)}` }
       case 'until':
-        await update($, sessionAtom, s => ({ ...s, mode: 'on' as const, untilMs: cmd.untilMs, stopReason: null }))
+        await update($, sessionAtom, s => ({ ...s, untilMs: cmd.untilMs }))
         await schedule($)
         return { text: `Keeping warm until ${hhmm(cmd.untilMs)}. ${await statusText($)}` }
       case 'now': {
+        // After a model switch or compaction a fork would re-write the context
+        // and read as a miss, benching pings everywhere.
+        const s = await read($, sessionAtom)
+        if (s.lastRequestAt === null || s.isCompacted) {
+          return { text: 'Nothing cached to keep warm yet: the next turn caches the conversation.' }
+        }
         cancelTimer()
-        const r = await ping($)
-        if (r.outcome === 'hit') await schedule($)
+        const r = await ping($, true)
+        const now = await $.clock.now()
+        if (r.outcome === 'miss') await stop($, 'cache-miss', { detail: r.detail ?? null })
+        // Inside the ping window, an error waits for the retry rather than pinging again at once.
+        else if (r.outcome === 'error' && now >= s.lastRequestAt + config.ttlMs - config.leadMs) await retryLater($, r)
+        else await schedule($)
         return {
           text: `Ping ${r.outcome}: ${kTokens(r.cacheRead)} read from cache, ${kTokens(r.cacheWrite)} written, ${r.output} output tokens.`,
         }

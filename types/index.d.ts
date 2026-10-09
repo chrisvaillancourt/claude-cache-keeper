@@ -6,7 +6,6 @@ export type Config = {
   leadMs: number
   maxIdleMs: number
   minContextTokens: number
-  maxLimitPercent: number
 }
 
 export type PingRecord = {

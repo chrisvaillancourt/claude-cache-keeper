@@ -16,9 +16,9 @@ On Opus 5.5, one cache read costs about 1/35–1/40 as much as re-caching the sa
   - Claude Code reports a 5-minute cache TTL (it says so on a model switch or resume). Pinging every few minutes costs more than a re-cache within the hour;
   - you've been idle longer than `maxIdleHours` (8). The window restarts on any main-loop turn, including ones you didn't type: a background agent's result arriving, a `/loop` wakeup. That's intended, because those turns use the main cache too. `/keepwarm for|until` extends the window to at least that time, and never shortens it;
   - the context is under `minContextTokens` (60k);
-  - five-hour or weekly usage is at or above `maxLimitPercent` (95). A ping uses far less than the re-cache it saves, so the ceiling sits close to the cap;
   - a ping misses the cache. A miss also benches automatic pings in every session until Claude Code's version changes, because forks can miss the conversation cache (anthropics/claude-code#100083) and a missed ping costs about a full re-cache. A `/keepwarm now` hit lifts the bench.
 - Checks itself: the first request of the first real turn after a pinged break longer than the TTL should read the context from cache. If it re-writes most of it, the pings didn't extend the main cache entry, and automatic pings are benched for that Claude Code version (log `kind: verify`). Later requests in that turn don't count, since they write what the turn added. There's no check after a compaction or model switch, since that turn re-writes the context anyway.
+- Keeps pinging whatever your plan usage. Past the plan's limit, extra usage bills per token, and a ping (a cache read, about 0.1× the input price) costs about a twentieth of the re-cache it saves (a 1-hour cache write, about 2×). If you're blocked at the limit instead, the ping fails with an API error and pinging stops until the next turn, with no bench.
 - Skips headless sessions (`-p`, SDK).
 - Logs to `~/.claude/cache-keeper/<session-id>.jsonl`:
   - every ping: token usage, plan-usage percentage before and after, and API-equivalent cost before and after;

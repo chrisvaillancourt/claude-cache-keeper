@@ -416,24 +416,24 @@ describe('cache-keeper', () => {
     expect(w.forks.length).toBe(0)
   })
 
-  test('keeps pinging at 90% plan usage', async ($, on) => {
-    const w = world(on, { percentUsed: 90 })
+  test('keeps pinging at and past the plan limit, where extra usage bills per token', async ($, on) => {
+    const w = world(on, { percentUsed: 104 })
     await startAndTurn($)
     await w.clock.advance(55 * MIN)
     expect(w.forks.length).toBe(1)
   })
 
-  test('stops at 95% plan usage, and the stop line records usage, model and version', async ($, on) => {
-    const w = world(on, { percentUsed: 95 })
+  test('a stop line records context, plan usage, model and version', async ($, on) => {
+    const w = world(on, { contextTokens: 5_000, percentUsed: 40 })
     await startAndTurn($)
     await w.clock.advance(55 * MIN)
     expect(w.forks.length).toBe(0)
     expect(w.logLines().at(-1)).toEqual(
       expect.objectContaining({
         kind: 'stop',
-        reason: 'near-limit',
-        limits: [{ kind: 'five_hour', percentUsed: 95 }],
-        contextTokens: 200_000,
+        reason: 'small-context',
+        limits: [{ kind: 'five_hour', percentUsed: 40 }],
+        contextTokens: 5_000,
         model: 'claude-opus-5-5',
         version: '2.1.292',
       }),

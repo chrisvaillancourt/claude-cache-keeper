@@ -33,12 +33,6 @@
       "title": "Minimum context (tokens)",
       "description": "Skip sessions whose context is smaller than this; they are cheap to re-cache.",
       "default": 60000
-    },
-    "maxLimitPercent": {
-      "type": "number",
-      "title": "Usage ceiling (%)",
-      "description": "Stop pinging when the five-hour or weekly plan usage reaches this percentage. A ping uses far less than the re-cache it saves, so only stop close to the cap.",
-      "default": 95
     }
   },
   "author": {

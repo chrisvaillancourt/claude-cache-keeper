@@ -1,4 +1,4 @@
-import type { ModelUsage, SessionRateLimit } from 'claude-code'
+import type { ModelUsage } from 'claude-code'
 
 import type { Config, Mode, Session } from '../types'
 
@@ -8,10 +8,9 @@ const DAY = 24 * HOUR
 
 export type Facts = {
   contextTokens: number
-  limits: readonly Pick<SessionRateLimit, 'kind' | 'percentUsed'>[]
 }
 
-export type StopReason = 'off' | 'expired' | 'short-ttl' | 'idle-limit' | 'small-context' | 'near-limit'
+export type StopReason = 'off' | 'expired' | 'short-ttl' | 'idle-limit' | 'small-context'
 
 export type Decision =
   | { action: 'idle' }
@@ -21,7 +20,7 @@ export type Decision =
 
 /**
  * What to do about the session's cache at `now`. Pure: the caller supplies
- * the session's state, the context size and plan usage, and the config.
+ * the session's state, the context size and the config.
  */
 export const decide = (s: Session, now: number, facts: Facts, config: Config): Decision => {
   const isInWindow = s.untilMs !== null && now <= s.untilMs
@@ -43,9 +42,9 @@ export const decide = (s: Session, now: number, facts: Facts, config: Config): D
   const keepUntil = Math.max(s.untilMs ?? 0, (s.lastTurnAt ?? s.lastRequestAt) + config.maxIdleMs)
   if (now > keepUntil) return { action: 'stop', reason: 'idle-limit' }
   if (facts.contextTokens < config.minContextTokens) return { action: 'stop', reason: 'small-context' }
-  if (facts.limits.some(l => l.percentUsed >= config.maxLimitPercent)) {
-    return { action: 'stop', reason: 'near-limit' }
-  }
+  // No plan-usage ceiling: past the limit, extra usage bills per token, and a
+  // ping costs about a twentieth of the re-cache it saves. A blocked ping is
+  // an API error, which stops pinging without benching.
 
   return { action: 'ping' }
 }

@@ -12,7 +12,6 @@ const config: Config = {
   leadMs: 5 * MIN,
   maxIdleMs: 4 * HOUR,
   minContextTokens: 60_000,
-  maxLimitPercent: 85,
 }
 
 const session = (over: Partial<Session> = {}): Session => ({
@@ -32,7 +31,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   ...over,
 })
 
-const facts = { contextTokens: 200_000, limits: [{ kind: 'five_hour', percentUsed: 20 }] }
+const facts = { contextTokens: 200_000 }
 
 describe('decide', () => {
   test('waits until the lead before expiry', () => {
@@ -106,17 +105,6 @@ describe('decide', () => {
     expect(decide(session(), 56 * MIN, { ...facts, contextTokens: 10_000 }, config)).toEqual({
       action: 'stop',
       reason: 'small-context',
-    })
-  })
-
-  test('stops near a plan limit', () => {
-    const limits = [
-      { kind: 'five_hour', percentUsed: 20 },
-      { kind: 'seven_day', percentUsed: 85 },
-    ]
-    expect(decide(session(), 56 * MIN, { ...facts, limits }, config)).toEqual({
-      action: 'stop',
-      reason: 'near-limit',
     })
   })
 

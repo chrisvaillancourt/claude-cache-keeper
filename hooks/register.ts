@@ -46,7 +46,6 @@ function configFrom(options: PluginOptions): Config {
     leadMs: num(options.leadMinutes, 5) * MIN,
     maxIdleMs: num(options.maxIdleHours, 8) * HOUR,
     minContextTokens: num(options.minContextTokens, 60_000),
-    maxLimitPercent: num(options.maxLimitPercent, 95),
   }
 }
 
@@ -218,7 +217,7 @@ async function schedule($: EngineInterface): Promise<void> {
   const s = await read($, sessionAtom)
   const now = await $.clock.now()
   const usage = await $.session.usage()
-  const d = decide(s, now, { contextTokens: usage.context.tokens ?? 0, limits: limitsOf(usage) }, config)
+  const d = decide(s, now, { contextTokens: usage.context.tokens ?? 0 }, config)
 
   switch (d.action) {
     case 'idle':

@@ -271,6 +271,20 @@ describe('cache-keeper', () => {
     expect(w.forks.length).toBe(3)
   })
 
+  test("toasts and status lines don't repeat the plugin name the engine already shows", async ($, on) => {
+    const w = world(on, { forkResults: [API_ERROR, { isAnswered: true, text: 'ok', usage: HIT }, { isAnswered: true, text: 'ok', usage: MISS }] })
+    await startAndTurn($)
+
+    await w.clock.advance(55 * MIN) // error: retry status
+    await w.clock.advance(2 * MIN) // hit: toast
+    await w.clock.advance(55 * MIN) // miss: stopped status
+    expect(w.forks.length).toBe(3)
+    expect(w.toasts.length).toBe(1)
+    expect(w.statuses).toContainEqual(expect.stringContaining('retrying at'))
+    expect(w.statuses.at(-1)).toContain('stopped (cache-miss)')
+    for (const text of [...w.toasts, ...w.statuses]) expect(text ?? '').not.toStartWith('cache-keeper')
+  })
+
   test('a second ping error in a row stops, without benching', async ($, on) => {
     const w = world(on, { forkResults: [API_ERROR, API_ERROR] })
     await startAndTurn($)

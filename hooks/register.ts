@@ -107,7 +107,7 @@ async function stop($: EngineInterface, reason: string, extra: Record<string, un
     await update($, sessionAtom, cur => ({ ...cur, stopReason: reason }))
     await appendLog($, { kind: 'stop', reason, pings: s.pings, ...(await logContext($)), ...extra })
   }
-  $.ui.status(reason === 'off' ? undefined : `cache-keeper: stopped (${reason})`)
+  $.ui.status(reason === 'off' ? undefined : `stopped (${reason})`)
 }
 
 /**
@@ -143,7 +143,7 @@ async function verifyRefresh($: EngineInterface, probe: NonNullable<Session['pro
   const at = await $.clock.now()
   if (verdict === 'cold') {
     await $.store.set('refreshFail', { version, at })
-    $.ui.toast('cache-keeper: pings did not keep the cache warm on this version; automatic pings paused')
+    $.ui.toast('pings did not keep the cache warm on this version; automatic pings paused')
   } else {
     await $.store.set('refreshVerified', { version, at })
   }
@@ -202,7 +202,7 @@ async function ping($: EngineInterface, isManual = false): Promise<PingRecord> {
     } else if (outcome === 'hit') {
       await $.store.delete('forkMiss')
     }
-    if (outcome === 'hit') $.ui.toast(`cache-keeper: kept ${kTokens(record.cacheRead)} cached (ping ${s.pings})`)
+    if (outcome === 'hit') $.ui.toast(`kept ${kTokens(record.cacheRead)} cached (ping ${s.pings})`)
     return record
   } finally {
     isPinging = false
@@ -251,7 +251,7 @@ async function retryLater($: EngineInterface, r: PingRecord) {
   const now = await $.clock.now()
   const at = retryAt(await read($, sessionAtom), now, config)
   if (at === null) return stop($, 'error', { detail: r.detail ?? null })
-  $.ui.status(`cache-keeper: ping failed, retrying at ${hhmm(at)}`)
+  $.ui.status(`ping failed, retrying at ${hhmm(at)}`)
   timer = $.clock.after(at - now, () => void schedule($))
 }
 

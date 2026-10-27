@@ -27,6 +27,7 @@ Both must pass before every commit. Behavior changes need a test in `hooks/*.tes
 - **Hot reloads reset module variables.** `register` and `session.start` run again; `$.state` and `$.store` survive. Anything that must persist goes in state or store, not in module variables.
 - Skip headless sessions (`e.isInteractive === false`).
 - Logging is best effort and must never throw out of a hook.
+- The engine shows status lines, toasts and `$.ui.log` lines under the plugin's name, so their text doesn't start with `cache-keeper:` (that read `cache-keeper: cache-keeper: …`).
 
 ## Conventions
 

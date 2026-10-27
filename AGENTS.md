@@ -21,7 +21,7 @@ Both must pass before every commit. Behavior changes need a test in `hooks/*.tes
 
 ## Design invariants
 
-- **Main conversation only.** A ping replays the main thread's last request. Hooks return early on a subagent's events (`e.agentId`, or `agent_id` on classic events), `turn.step` also when `e.turnId` isn't the main turn whose `turn.start` the module saw, and `turn.complete` also when that's so while a ping runs (a fork may raise its own). Subagents raise no `turn.start`. Never arm, reset or ping on a subagent's activity.
+- **Main conversation only.** A ping replays the main thread's last request. Hooks return early on a subagent's events (`e.agentId`, or `agent_id` on classic events), `turn.step` also when `e.turnId` isn't the main turn whose `turn.start` the module saw, and `turn.complete` also when that's so while a ping runs (a fork may raise its own). Subagent and teammate runs raise `turn.start` too (with `e.agentId`; seen on Claude Code 2.1.310), so `turn.start` returns early on them like the others. Never arm, reset or ping on a subagent's activity.
 - **Any main-loop turn resets the idle window**, typed or not (a background agent's result, a `/loop` wakeup). That's intended, so don't filter those turns out.
 - **Misses are expensive.** A fork that misses costs about a full re-cache, so a miss or a failed refresh check benches automatic pings for that Claude Code version via `$.store`. Don't weaken the bench without evidence. Do keep things that aren't misses out of it: an API error, or the first request after a model switch or compaction.
 - **Hot reloads reset module variables.** `register` and `session.start` run again; `$.state` and `$.store` survive. Anything that must persist goes in state or store, not in module variables.

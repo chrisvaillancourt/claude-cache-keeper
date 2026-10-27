@@ -295,6 +295,8 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    // Subagent and teammate runs raise turn.start too (seen on 2.1.310); only the main loop counts.
+    if (e.agentId !== undefined) return next(e)
     cancelTimer()
     const now = await $.clock.now()
     const s = await read($, sessionAtom)

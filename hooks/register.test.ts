@@ -198,6 +198,27 @@ describe('cache-keeper', () => {
     expect(w.forks.length).toBe(1)
   })
 
+  test("a background subagent's whole turn while idle leaves the keep-alive armed", async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+
+    await w.clock.advance(50 * MIN)
+    await $.turn.start({ text: '', turnId: 's1', agentId: 'a1' })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 's1', reason: 'answer', agentId: 'a1' })
+    await w.clock.advance(5 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test("a subagent turn inside a main turn doesn't replace the main turn", async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(70 * MIN) // ping at 55; the turn comes 70 minutes after the last real one
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    await $.turn.start({ text: 'task', turnId: 's1', agentId: 'a1' })
+    await step($, w, 't2', 0, { ...HIT, cache_creation_input_tokens: 3_000 })
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'verify', verdict: 'warm', idleMinutes: 70 }))
+  })
+
   test('a turn that completes while a ping is in flight still counts', async ($, on) => {
     const w = world(on, { duringFork: () => turn($, 't2') })
     await startAndTurn($)

@@ -32,6 +32,12 @@ On Opus 5.5, one cache read costs about 1/35–1/40 as much as re-caching the sa
 - `for 3h` / `until 18:00`: keep warm at least that long, even when the mode is off. When the window ends, the mode and idle limit apply again.
 - `now`: ping right away and report what the cache served. It won't ping after a model switch or compaction, when nothing is cached yet.
 
+### Across a restart
+
+The setting (`on`/`off`/`auto` and a `for`/`until` window) is also kept in the plugin's store as `mode/<session id>`, written on each change and deleted when it's back to `auto` with no window. When Claude Code moves the session to a new process (a background session moved by an upgrade, a crash and resume), the new process restores the setting at session start: an off switch stays off and a window still open stays open (one that ended in the meantime is dropped). A hot reload keeps the live setting and ignores the record. Records not written for 30 days, and unreadable ones, are dropped at the next session start. A store failure is ignored; the setting still holds in the running process.
+
+What doesn't survive a restart: the timer and the rest of the keeper's bookkeeping (last request, pings, a pending refresh check). Those described the old process's cache; nothing is pinged in the new process until the next main turn re-arms the keeper. `/clear` starts a new session id, so the setting doesn't carry across it. Headless sessions are skipped, as always.
+
 ## Install
 
 ```sh

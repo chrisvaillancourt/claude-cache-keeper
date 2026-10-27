@@ -43,6 +43,14 @@ export type Session = {
   probe: { contextTokens: number; idleMinutes: number; pings: number } | null
 }
 
+/**
+ * The /keepwarm setting as kept in `$.store` under `mode/<session id>`, so it
+ * survives the session moving to a new process (where `$.state` reads empty).
+ * `at` is refreshed on every write. Only the setting: the rest of Session is the
+ * old process's cache bookkeeping.
+ */
+export type ModeRecord = { mode: Mode; untilMs: number | null; at: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'cache-keeper': { session: Session }

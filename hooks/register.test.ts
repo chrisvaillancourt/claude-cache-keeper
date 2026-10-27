@@ -28,6 +28,8 @@ const world = (
     contextTokens?: number
     percentUsed?: number
     store?: Record<string, unknown>
+    /** Every $.store call is refused. */
+    storeFails?: boolean
     /** Fork results in order; once used up, a hit with `usage`. */
     forkResults?: ModelForkResult[]
     /** Runs while a fork is in flight, before it answers. */
@@ -36,7 +38,13 @@ const world = (
 ) => {
   const clock = mock.clock(on, { now: T0 })
   mock.env(on, { HOME: '/home/t' })
-  mock.store(on, opts.store ?? {})
+  // $.store as a map the test can read back (mock.store keeps its own); shared by every session.
+  const store = new Map<string, unknown>(Object.entries(opts.store ?? {}))
+  const storeOp = <T>(f: () => T) => (opts.storeFails ? { deny: 'store unavailable' } : { value: f() })
+  on('store.get', ($, e) => storeOp(() => store.get(e.key)))
+  on('store.set', ($, e) => storeOp(() => void store.set(e.key, JSON.parse(JSON.stringify(e.value)))))
+  on('store.delete', ($, e) => storeOp(() => void store.delete(e.key)))
+  on('store.keys', () => storeOp(() => [...store.keys()]))
   on('session.version', () => ({ value: { version: '2.1.292', base: '2.1.292', builtAt: '2026-10-01' } }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
 
@@ -105,7 +113,7 @@ const world = (
 
   const logLines = () => (files.get(LOG) ?? '').split('\n').filter(Boolean).map(l => JSON.parse(l))
 
-  return { clock, files, forks, toasts, statuses, logLines, stepUsage: (u: ModelUsage) => (stepUsage = u) }
+  return { clock, files, forks, toasts, statuses, logLines, store, stepUsage: (u: ModelUsage) => (stepUsage = u) }
 }
 
 const SUMMARY = [{ role: 'user' as const, text: 'summary', toolUses: [] }]
@@ -581,5 +589,126 @@ describe('cache-keeper', () => {
     await $.turn.complete({ answer: 'done', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer' })
     await w.clock.advance(2 * HOUR)
     expect(w.forks.length).toBe(0)
+  })
+})
+
+describe('the /keepwarm setting survives a process move', () => {
+  const KEY = 'mode/sid-1'
+  const DAY = 24 * HOUR
+  const start = ($: any) => $.session.start({ cwd: '/x', surface: 'terminal', isInteractive: true })
+  const keepwarm = ($: any, args: string) => $.command.run({ command: 'keepwarm', args, ...COMMAND })
+
+  test('/keepwarm off, on and for are written under the session id; auto with no window deletes the record', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    expect(w.store.has(KEY)).toBe(false)
+    await keepwarm($, 'off')
+    expect(w.store.get(KEY)).toEqual({ mode: 'off', untilMs: null, at: T0 })
+    await keepwarm($, 'for 3h')
+    expect(w.store.get(KEY)).toEqual({ mode: 'off', untilMs: T0 + 3 * HOUR, at: T0 })
+    await keepwarm($, 'auto')
+    expect(w.store.has(KEY)).toBe(false)
+    await keepwarm($, 'for 1h')
+    expect(w.store.get(KEY)).toEqual({ mode: 'auto', untilMs: T0 + HOUR, at: T0 })
+    await keepwarm($, 'status')
+    expect(w.store.get(KEY)).toEqual({ mode: 'auto', untilMs: T0 + HOUR, at: T0 })
+  })
+
+  test('a window that ends at a turn is dropped from the record too', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await keepwarm($, 'for 1h')
+    await w.clock.advance(2 * HOUR)
+    await turn($, 't2')
+    expect(w.store.has(KEY)).toBe(false)
+  })
+
+  test('a new process restores an off switch, and the next turn arms nothing', async ($, on) => {
+    const w = world(on, { store: { [KEY]: { mode: 'off', untilMs: null, at: T0 - DAY } } })
+    await startAndTurn($)
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+    expect((await keepwarm($, 'status')).text).toContain('keep-warm off')
+    // kept, with its time refreshed
+    expect(w.store.get(KEY)).toEqual({ mode: 'off', untilMs: null, at: T0 })
+  })
+
+  test('a new process restores a window that is still open, and keeps warm past the idle limit', async ($, on) => {
+    const w = world(on, { store: { [KEY]: { mode: 'auto', untilMs: T0 + 10 * HOUR, at: T0 - HOUR } } })
+    await startAndTurn($)
+    expect((await keepwarm($, 'status')).text).toContain('keeping warm until')
+    await w.clock.advance(12 * HOUR)
+    expect(w.forks.length).toBe(10)
+  })
+
+  test('a window that ended while the session was away is not restored', async ($, on) => {
+    const w = world(on, { store: { [KEY]: { mode: 'auto', untilMs: T0 - HOUR, at: T0 - 4 * HOUR } } })
+    await start($)
+    expect((await keepwarm($, 'status')).text).not.toContain('keeping warm until')
+    expect(w.store.has(KEY)).toBe(false)
+  })
+
+  test('a hot reload keeps the live state and leaves the record alone', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await keepwarm($, 'off')
+    // a record that disagrees with the live state: the state wins on a reload
+    w.store.set(KEY, { mode: 'on', untilMs: null, at: T0 - DAY })
+    await start($)
+    expect((await keepwarm($, 'status')).text).toContain('keep-warm off')
+    expect(w.store.get(KEY)).toEqual({ mode: 'on', untilMs: null, at: T0 - DAY })
+  })
+
+  test('the hot-reload record path does not run in a session that has state but no setting', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    w.store.set(KEY, { mode: 'off', untilMs: null, at: T0 })
+    await start($)
+    expect((await keepwarm($, 'status')).text).toContain('keep-warm auto')
+  })
+
+  test('only this session’s record is restored; stale and unreadable mode records are pruned; other keys stay', async ($, on) => {
+    const w = world(on, {
+      store: {
+        'mode/other': { mode: 'off', untilMs: null, at: T0 - DAY },
+        'mode/stale': { mode: 'off', untilMs: null, at: T0 - 31 * DAY },
+        'mode/bad': { mode: 'sometimes', untilMs: null, at: T0 },
+        refreshFail: { version: '2.1.291', at: 0 },
+        refreshVerified: { version: '2.1.291', at: 0 },
+      },
+    })
+    await startAndTurn($)
+    await w.clock.advance(1 * HOUR)
+    expect(w.forks.length).toBe(1)
+    expect(w.store.get('mode/other')).toEqual({ mode: 'off', untilMs: null, at: T0 - DAY })
+    expect(w.store.has('mode/stale')).toBe(false)
+    expect(w.store.has('mode/bad')).toBe(false)
+    expect(w.store.has('refreshFail')).toBe(true)
+    expect(w.store.has('refreshVerified')).toBe(true)
+  })
+
+  test('a malformed record for this session is ignored', async ($, on) => {
+    const w = world(on, { store: { [KEY]: { mode: 'off', untilMs: 'later', at: T0 } } })
+    await startAndTurn($)
+    await w.clock.advance(1 * HOUR)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('a store that fails leaves the keeper and the command working', async ($, on) => {
+    const w = world(on, { storeFails: true })
+    await startAndTurn($)
+    expect((await keepwarm($, 'off')).text).toContain('off')
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+  })
+
+  test('subagent turns do not touch the record', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await keepwarm($, 'for 1h')
+    await w.clock.advance(2 * HOUR)
+    await $.turn.start({ text: '', turnId: 'a1', agentId: 'agent-1' })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'a1', reason: 'answer', agentId: 'agent-1' })
+    expect(w.store.get(KEY)).toEqual({ mode: 'auto', untilMs: T0 + HOUR, at: T0 })
   })
 })

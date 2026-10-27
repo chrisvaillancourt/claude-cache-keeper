@@ -1,6 +1,6 @@
 import type { ModelUsage } from 'claude-code'
 
-import type { Config, Mode, Session } from '../types'
+import type { Config, Mode, ModeRecord, Session } from '../types'
 
 const MIN = 60_000
 const HOUR = 60 * MIN
@@ -107,3 +107,32 @@ export const parseKeepwarmArgs = (args: string, now: number, tzOffsetMinutes: nu
 
   return { kind: 'error', message: USAGE }
 }
+
+/** `$.store` keys for the per-session /keepwarm setting: `mode/<session id>`. The store is shared by every session. */
+export const MODE_KEY_PREFIX = 'mode/'
+/** Setting records not written for this long (sessions never resumed) are dropped at session start. */
+export const MODE_RECORD_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+export const modeKey = (sessionId: string) => `${MODE_KEY_PREFIX}${sessionId}`
+
+/** Whether the setting differs from the default, so it has a record to keep. */
+export const hasSetting = (s: Pick<Session, 'mode' | 'untilMs'>) => s.mode !== 'auto' || s.untilMs !== null
+
+/** A record read back from the store; anything else (an older version, a corrupted value) is ignored. */
+export const isModeRecord = (v: unknown): v is ModeRecord => {
+  if (typeof v !== 'object' || v === null) return false
+  const r = v as Record<string, unknown>
+  const isFiniteNum = (x: unknown) => typeof x === 'number' && Number.isFinite(x)
+  return (
+    (r.mode === 'auto' || r.mode === 'on' || r.mode === 'off') &&
+    (r.untilMs === null || isFiniteNum(r.untilMs)) &&
+    isFiniteNum(r.at) &&
+    hasSetting(r as ModeRecord)
+  )
+}
+
+/** The setting a fresh process takes from a record: a window that has ended by `now` is dropped. */
+export const restoredSetting = (r: ModeRecord, now: number): Pick<Session, 'mode' | 'untilMs'> => ({
+  mode: r.mode,
+  untilMs: r.untilMs !== null && r.untilMs > now ? r.untilMs : null,
+})

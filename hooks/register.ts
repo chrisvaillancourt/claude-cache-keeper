@@ -1,7 +1,18 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, PluginOptions, Register, SessionUsage, Timer } from 'claude-code'
 
-import { classifyPing, decide, parseKeepwarmArgs, retryAt } from './policy'
+import {
+  MODE_KEY_PREFIX,
+  MODE_RECORD_TTL_MS,
+  classifyPing,
+  decide,
+  hasSetting,
+  isModeRecord,
+  modeKey,
+  parseKeepwarmArgs,
+  restoredSetting,
+  retryAt,
+} from './policy'
 import type { Config, PingRecord, Session } from '../types'
 
 const MIN = 60_000
@@ -209,6 +220,48 @@ async function ping($: EngineInterface, isManual = false): Promise<PingRecord> {
   }
 }
 
+/**
+ * Writes the /keepwarm setting through to `$.store`, or deletes the record when
+ * it's back to the default (auto, no window); best effort.
+ */
+async function recordSetting($: EngineInterface, s: Pick<Session, 'mode' | 'untilMs'>) {
+  try {
+    const key = modeKey(await $.session.id())
+    if (hasSetting(s)) await $.store.set(key, { mode: s.mode, untilMs: s.untilMs, at: await $.clock.now() })
+    else await $.store.delete(key)
+  } catch {
+    // Best effort: the setting still holds for this process.
+  }
+}
+
+/**
+ * In a fresh process (`$.state` never written: version 0) the setting an earlier
+ * process left for this session id, if any; null after a hot reload or without one.
+ */
+async function lostSetting($: EngineInterface, now: number): Promise<Pick<Session, 'mode' | 'untilMs'> | null> {
+  try {
+    if ((await $.state.get({ plugin: 'cache-keeper', key: 'session' })).version !== 0) return null
+    const record = await $.store.get(modeKey(await $.session.id()))
+    return isModeRecord(record) ? restoredSetting(record, now) : null
+  } catch {
+    return null
+  }
+}
+
+/** Drops setting records other sessions left behind and never came back to, and unreadable ones. Only `mode/` keys. */
+async function pruneSettings($: EngineInterface, now: number) {
+  try {
+    const cutoff = now - MODE_RECORD_TTL_MS
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(MODE_KEY_PREFIX)) continue
+      const record = await $.store.get(key)
+      if (!isModeRecord(record) || record.at < cutoff) await $.store.delete(key)
+    }
+  } catch {
+    // Best effort.
+  }
+}
+
 /** Decides what the session's cache needs now and acts: wait, ping, or stop. */
 async function schedule($: EngineInterface): Promise<void> {
   cancelTimer()
@@ -288,8 +341,15 @@ export const register: Register = (on, options) => {
       description: 'Prompt-cache keep-alive: status, on, off, auto, now, for <n>h, until HH:MM',
       argumentHint: '[status|on|off|auto|now|for 3h|until 18:00]',
     })
+    const now = await $.clock.now()
+    // Read before the update below writes the state: version 0 means a fresh process.
+    const lost = await lostSetting($, now)
+    await pruneSettings($, now)
     // Spread over INITIAL so state saved by an older version gains the fields added since.
-    await update($, sessionAtom, s => ({ ...INITIAL, ...s, isTurnRunning: false, turnId: null }))
+    // In a fresh process only the /keepwarm setting comes back; the next main turn re-arms the rest.
+    const s = await update($, sessionAtom, s => ({ ...INITIAL, ...s, ...lost, isTurnRunning: false, turnId: null }))
+    // Rewrite (refreshing its time) or delete (a window that ended while away) the record adopted.
+    if (lost !== null) await recordSetting($, s)
     await schedule($)
     return result
   })
@@ -343,7 +403,8 @@ export const register: Register = (on, options) => {
     const { turnId } = await read($, sessionAtom)
     if (isPinging && e.turnId !== turnId) return result
     const now = await $.clock.now()
-    await update($, sessionAtom, s => ({
+    const before = await read($, sessionAtom)
+    const s = await update($, sessionAtom, s => ({
       ...s,
       probe: null,
       isTurnRunning: false,
@@ -354,6 +415,7 @@ export const register: Register = (on, options) => {
       pingErrors: 0,
       untilMs: s.untilMs !== null && s.untilMs <= now ? null : s.untilMs,
     }))
+    if (s.untilMs !== before.untilMs) await recordSetting($, s)
     await schedule($)
     return result
   })
@@ -394,11 +456,11 @@ export const register: Register = (on, options) => {
       case 'status':
         return { text: await statusText($) }
       case 'mode':
-        await update($, sessionAtom, s => ({ ...s, mode: cmd.mode, untilMs: null }))
+        await recordSetting($, await update($, sessionAtom, s => ({ ...s, mode: cmd.mode, untilMs: null })))
         await schedule($)
         return { text: `Keep-warm ${cmd.mode}. ${await statusText($)}` }
       case 'until':
-        await update($, sessionAtom, s => ({ ...s, untilMs: cmd.untilMs }))
+        await recordSetting($, await update($, sessionAtom, s => ({ ...s, untilMs: cmd.untilMs })))
         await schedule($)
         return { text: `Keeping warm until ${hhmm(cmd.untilMs)}. ${await statusText($)}` }
       case 'now': {

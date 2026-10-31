@@ -26,7 +26,7 @@ const INITIAL: Session = {
   untilMs: null,
   lastRequestAt: null,
   lastTurnAt: null,
-  isTurnRunning: false,
+  isRequestRunning: false,
   turnId: null,
   cacheTtl: null,
   isCompacted: false,
@@ -135,13 +135,14 @@ async function isBenched($: EngineInterface) {
 }
 
 /**
- * Judges the first request of the first real turn after a pinged break longer
- * than the TTL: had the pings not refreshed the main entry, it re-writes most
- * of the context. Only the first request counts; later ones in the turn write
- * what the turn added.
+ * Judges the first main-loop request after a pinged break longer than the TTL
+ * (a new turn, or one going on after a mid-turn wait): had the pings not
+ * refreshed the main entry, it reads little more than the system prompt from
+ * cache. Judged by what it read, not wrote: after a mid-turn wait it also
+ * writes the last response and the tool results, which can be large.
  */
 async function verifyRefresh($: EngineInterface, probe: NonNullable<Session['probe']>, usage: ModelUsage) {
-  const verdict = usage.cache_creation_input_tokens < 0.5 * probe.contextTokens ? 'warm' : 'cold'
+  const verdict = usage.cache_read_input_tokens >= 0.5 * probe.contextTokens ? 'warm' : 'cold'
   const version = (await $.session.version()).version
   await appendLog($, {
     kind: 'verify',
@@ -262,6 +263,67 @@ async function pruneSettings($: EngineInterface, now: number) {
   }
 }
 
+/**
+ * At the start of a request of the main turn `turnId`: holds pings off, and
+ * marks the request a probe when it follows a pinged break longer than the
+ * TTL (between turns, or mid-turn while a tool or prompt waited). False for
+ * any other turn's request.
+ */
+async function beginRequest($: EngineInterface, turnId: string): Promise<boolean> {
+  try {
+    const s = await read($, sessionAtom)
+    if (s.turnId !== turnId) return false
+    cancelTimer()
+    const now = await $.clock.now()
+    const isProbe =
+      s.pings > 0 &&
+      !s.isCompacted &&
+      s.lastTurnAt !== null &&
+      s.lastRequestAt !== null &&
+      now - s.lastTurnAt > config.ttlMs &&
+      now - s.lastRequestAt < config.ttlMs
+    const probe = isProbe
+      ? {
+          contextTokens: (await $.session.usage()).context.tokens ?? 0,
+          idleMinutes: Math.round((now - (s.lastTurnAt ?? now)) / MIN),
+          pings: s.pings,
+        }
+      : null
+    await update($, sessionAtom, cur => ({ ...cur, isRequestRunning: true, probe }))
+    return true
+  } catch {
+    // Best effort; never fail the turn over it.
+    return false
+  }
+}
+
+/**
+ * At the end of a main-turn request: `usage` null or undefined when no response came. A request
+ * that answered refreshed the cache, so the clock restarts from it and the
+ * timer re-arms for the wait before the next one; a probe is judged.
+ */
+async function endRequest($: EngineInterface, turnId: string, usage: ModelUsage | null | undefined) {
+  try {
+    const s = await read($, sessionAtom)
+    // A hot reload or the turn's end in between: nothing of this request to record.
+    if (s.turnId !== turnId) return
+    const now = await $.clock.now()
+    const isDone = usage !== undefined && usage !== null
+    await update($, sessionAtom, cur => ({
+      ...cur,
+      isRequestRunning: false,
+      probe: null,
+      ...(isDone
+        ? { isCompacted: false, lastRequestAt: now, lastTurnAt: now, pings: 0, pingErrors: 0 }
+        : {}),
+    }))
+    if (isDone && s.probe !== null) await verifyRefresh($, s.probe, usage)
+    await schedule($)
+  } catch {
+    // Best effort; never fail the turn over it.
+  }
+}
+
 /** Decides what the session's cache needs now and acts: wait, ping, or stop. */
 async function schedule($: EngineInterface): Promise<void> {
   cancelTimer()
@@ -318,7 +380,7 @@ async function statusText($: EngineInterface) {
     if (timer !== null) parts.push(`next ping ${hhmm(expiresAt - config.leadMs)}`)
   }
   if (s.untilMs !== null && s.untilMs > now) parts.push(`keeping warm until ${hhmm(s.untilMs)}`)
-  parts.push(`${s.pings} ping${s.pings === 1 ? '' : 's'} since last turn`)
+  parts.push(`${s.pings} ping${s.pings === 1 ? '' : 's'} since last request`)
   if (s.lastPing) {
     parts.push(`last ping ${hhmm(s.lastPing.at)} ${s.lastPing.outcome} (${kTokens(s.lastPing.cacheRead)} cached)`)
   }
@@ -347,7 +409,7 @@ export const register: Register = (on, options) => {
     await pruneSettings($, now)
     // Spread over INITIAL so state saved by an older version gains the fields added since.
     // In a fresh process only the /keepwarm setting comes back; the next main turn re-arms the rest.
-    const s = await update($, sessionAtom, s => ({ ...INITIAL, ...s, ...lost, isTurnRunning: false, turnId: null }))
+    const s = await update($, sessionAtom, s => ({ ...INITIAL, ...s, ...lost, isRequestRunning: false, turnId: null }))
     // Rewrite (refreshing its time) or delete (a window that ended while away) the record adopted.
     if (lost !== null) await recordSetting($, s)
     await schedule($)
@@ -358,41 +420,27 @@ export const register: Register = (on, options) => {
     // Subagent and teammate runs raise turn.start too (seen on 2.1.310); only the main loop counts.
     if (e.agentId !== undefined) return next(e)
     cancelTimer()
-    const now = await $.clock.now()
-    const s = await read($, sessionAtom)
-    const isProbe =
-      s.pings > 0 &&
-      !s.isCompacted &&
-      s.lastTurnAt !== null &&
-      s.lastRequestAt !== null &&
-      now - s.lastTurnAt > config.ttlMs &&
-      now - s.lastRequestAt < config.ttlMs
-    const probe = isProbe
-      ? {
-          contextTokens: (await $.session.usage()).context.tokens ?? 0,
-          idleMinutes: Math.round((now - (s.lastTurnAt ?? now)) / MIN),
-          pings: s.pings,
-        }
-      : null
-    await update($, sessionAtom, cur => ({ ...cur, isTurnRunning: true, turnId: e.turnId, probe }))
+    // Until its first request the turn is about to use the cache: no ping in between.
+    await update($, sessionAtom, cur => ({ ...cur, isRequestRunning: true, turnId: e.turnId, probe: null }))
     return next(e)
   })
 
+  // Each main-loop request refreshes the cache, and the wait before the next
+  // one (a tool, a question or permission prompt left open) can outlast the TTL.
   on('turn.step', async function* ($, e, next) {
-    const result = yield* next(e)
-    if (e.agentId !== undefined) return result
+    // Only the main turn whose start this module saw counts. While a ping runs,
+    // its fork may raise a step under the waiting turn's id: skip them all, as
+    // the ping refreshes the cache itself and the turn's next request catches up.
+    const isMain = e.agentId === undefined && !isPinging && (await beginRequest($, e.turnId))
+    if (!isMain) return yield* next(e)
+    let usage: ModelUsage | null | undefined
     try {
-      const s = await read($, sessionAtom)
-      if (s.turnId !== e.turnId) return result
-      if (s.isCompacted) await update($, sessionAtom, cur => ({ ...cur, isCompacted: false }))
-      if (e.index === 0 && s.probe !== null) {
-        await update($, sessionAtom, cur => ({ ...cur, probe: null }))
-        if (result.usage !== null) await verifyRefresh($, s.probe, result.usage)
-      }
-    } catch {
-      // The check is best effort; never fail the turn over it.
+      const result = yield* next(e)
+      usage = result.usage
+      return result
+    } finally {
+      await endRequest($, e.turnId, usage)
     }
-    return result
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -407,7 +455,7 @@ export const register: Register = (on, options) => {
     const s = await update($, sessionAtom, s => ({
       ...s,
       probe: null,
-      isTurnRunning: false,
+      isRequestRunning: false,
       turnId: null,
       lastRequestAt: now,
       lastTurnAt: now,

@@ -22,24 +22,29 @@ export type Session = {
   mode: Mode
   /** A /keepwarm for|until window: keeps warm at least this long, whatever the mode. */
   untilMs: number | null
-  /** When the cache was last refreshed: the end of a main turn or a ping. */
+  /** When the cache was last refreshed: the end of a main-loop request or turn, or a ping. */
   lastRequestAt: number | null
-  /** When the last real (non-ping) main turn ended. */
+  /** When the last real (non-ping) main-loop request or turn ended. */
   lastTurnAt: number | null
-  isTurnRunning: boolean
+  /**
+   * A main-loop request is running or about to (from turn.start to its first
+   * request). False between a turn's requests, while a tool runs or a prompt
+   * (a question, a permission) waits for the person: the cache can lapse then.
+   */
+  isRequestRunning: boolean
   /** The main turn in progress, from its turn.start; null between turns. */
   turnId: string | null
   /** The prompt-cache TTL the engine last reported (on a model switch or resume). */
   cacheTtl: '5m' | '1h' | null
   /** Compacted since the last main-loop request: nothing cached matches the next one. */
   isCompacted: boolean
-  /** Pings since the last real turn. */
+  /** Pings since the last real main-loop request. */
   pings: number
-  /** Ping errors in a row since the last hit or real turn. */
+  /** Ping errors in a row since the last hit or real request. */
   pingErrors: number
   lastPing: PingRecord | null
   stopReason: string | null
-  /** Set at the start of a real turn that follows a pinged break longer than the TTL. */
+  /** Set at the start of a main-loop request that follows a pinged break longer than the TTL. */
   probe: { contextTokens: number; idleMinutes: number; pings: number } | null
 }
 

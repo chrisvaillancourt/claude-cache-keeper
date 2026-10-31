@@ -88,7 +88,7 @@ const world = (
     return { value: queued.shift() ?? { isAnswered: true as const, text: 'ok', usage: opts.usage ?? HIT } }
   })
 
-  let stepUsage: ModelUsage = HIT
+  let stepUsage: ModelUsage | null = HIT
   on('turn.step', async function* ($, e) {
     return {
       turnId: e.turnId,
@@ -96,7 +96,7 @@ const world = (
       answer: '',
       toolUses: [],
       stopReason: 'end_turn' as const,
-      usage: { ...stepUsage, model: 'claude-opus-5-5' },
+      usage: stepUsage === null ? null : { ...stepUsage, model: 'claude-opus-5-5' },
     }
   })
 
@@ -113,7 +113,7 @@ const world = (
 
   const logLines = () => (files.get(LOG) ?? '').split('\n').filter(Boolean).map(l => JSON.parse(l))
 
-  return { clock, files, forks, toasts, statuses, logLines, store, stepUsage: (u: ModelUsage) => (stepUsage = u) }
+  return { clock, files, forks, toasts, statuses, logLines, store, stepUsage: (u: ModelUsage | null) => (stepUsage = u) }
 }
 
 const SUMMARY = [{ role: 'user' as const, text: 'summary', toolUses: [] }]
@@ -254,6 +254,115 @@ describe('cache-keeper', () => {
     await $.turn.complete({ answer: 'done', durationMs: 1000, isAborted: false, turnId: 't3', reason: 'answer' })
     await w.clock.advance(55 * MIN)
     expect(w.forks.length).toBe(1)
+  })
+
+  test('a question left open mid-turn is pinged, and the request after the answer checks the pings', async ($, on) => {
+    const w = world(on)
+    let answer!: () => void
+    const isAnswered = new Promise<void>(r => (answer = r))
+    on('tool.call', { tool: 'AskUserQuestion' }, async () => {
+      await isAnswered
+      return { result: { answers: {} } }
+    })
+    await startAndTurn($)
+    await w.clock.advance(10 * MIN)
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await step($, w, 't2', 0, HIT) // the request that asks
+    const question = $.tool.call({ tool: 'AskUserQuestion', questions: [] } as any)
+
+    await w.clock.advance(54 * MIN)
+    expect(w.forks.length).toBe(0)
+    await w.clock.advance(1 * MIN) // 55 minutes after the asking request
+    expect(w.forks.length).toBe(1)
+    await w.clock.advance(55 * MIN)
+    expect(w.forks.length).toBe(2)
+
+    answer()
+    await question
+    await step($, w, 't2', 1, { ...HIT, cache_creation_input_tokens: 2_000 })
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'verify', verdict: 'warm', idleMinutes: 110 }))
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+  })
+
+  test('a cold request after a pinged mid-turn wait benches automatic pings', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await step($, w, 't2', 0, HIT)
+    await w.clock.advance(70 * MIN) // a tool or a prompt holds the turn; ping at 55
+    expect(w.forks.length).toBe(1)
+    await step($, w, 't2', 1, { ...HIT, cache_read_input_tokens: 20_000, cache_creation_input_tokens: 190_000 })
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'verify', verdict: 'cold' }))
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('a request after a mid-turn wait that writes large tool results is still warm', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await step($, w, 't2', 0, HIT)
+    await w.clock.advance(70 * MIN) // a permission prompt waits; ping at 55
+    await step($, w, 't2', 1, { ...HIT, cache_creation_input_tokens: 120_000 }) // the prefix read, the results written
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'verify', verdict: 'warm' }))
+    expect(w.store.has('refreshFail')).toBe(false)
+  })
+
+  test("a ping's own request carrying the main turn's id is not a main request", async ($, on) => {
+    let w!: ReturnType<typeof world>
+    const forkStep = async () => {
+      await step($, w, 't2', 1, HIT) // as if the fork raised it under the waiting turn
+    }
+    w = world(on, { duringFork: forkStep })
+    await startAndTurn($)
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await step($, w, 't2', 0, HIT)
+    await w.clock.advance(24 * HOUR) // a question left open
+    expect(w.forks.length).toBe(8)
+  })
+
+  test('a request that failed does not restart the cache clock', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(50 * MIN)
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    w.stepUsage(null) // no response came back
+    const s = $.turn.step({ turnId: 't2', index: 0, model: 'claude-opus-5-5', messageCount: 10 })
+    for await (const _ of s);
+    await w.clock.advance(5 * MIN) // still waiting in the turn: the cache from t1 is due its ping
+    expect(w.forks.length).toBe(1)
+  })
+
+  test("a turn's requests while off log off once", async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await $.command.run({ command: 'keepwarm', args: 'off', ...COMMAND })
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await step($, w, 't2', 0, HIT)
+    await step($, w, 't2', 1, HIT)
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    expect(w.logLines().filter(l => l.kind === 'stop').map(l => l.reason)).toEqual(['off'])
+  })
+
+  test('no ping between a turn start and its first request', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(50 * MIN)
+    await $.turn.start({ text: 'next', turnId: 't2' }) // prompt hooks, queued work: no request yet
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+  })
+
+  test('the idle limit counts from the last main request, not the turn start', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await $.turn.start({ text: 'long', turnId: 't2' })
+    await w.clock.advance(3 * HOUR)
+    await step($, w, 't2', 0, HIT) // three hours into the turn, then a question waits
+    await w.clock.advance(12 * HOUR)
+    expect(w.forks.length).toBe(8)
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'stop', reason: 'idle-limit' }))
   })
 
   test('a cache miss stops pinging', async ($, on) => {

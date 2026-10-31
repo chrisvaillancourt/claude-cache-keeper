@@ -26,7 +26,10 @@ export const decide = (s: Session, now: number, facts: Facts, config: Config): D
   const isInWindow = s.untilMs !== null && now <= s.untilMs
   const isOn = isInWindow || s.mode === 'on' || (s.mode === 'auto' && config.enabled)
   if (!isOn) return { action: 'stop', reason: 'off' }
-  if (s.isTurnRunning || s.lastRequestAt === null || s.isCompacted) return { action: 'idle' }
+  // Between a turn's requests (a tool running, a question or permission prompt
+  // waiting) the cache lapses like it does between turns, so only a request
+  // under way holds pings off.
+  if (s.isRequestRunning || s.lastRequestAt === null || s.isCompacted) return { action: 'idle' }
   // A five-minute cache needs a ping every few minutes: within the hour that costs more than a re-cache.
   if (s.cacheTtl === '5m') return { action: 'stop', reason: 'short-ttl' }
 
@@ -36,8 +39,9 @@ export const decide = (s: Session, now: number, facts: Facts, config: Config): D
   const pingAt = expiresAt - config.leadMs
   if (now < pingAt) return { action: 'wait', at: pingAt }
 
-  // lastTurnAt moves on every main-loop turn, typed or not (a background
-  // agent's result, a /loop wakeup): those extend the idle window by design.
+  // lastTurnAt moves on every main-loop request and turn, typed or not (a
+  // background agent's result, a /loop wakeup): those extend the idle window by
+  // design. A question left open counts from the request that asked it.
   // A /keepwarm for|until window extends that, never shortens it.
   const keepUntil = Math.max(s.untilMs ?? 0, (s.lastTurnAt ?? s.lastRequestAt) + config.maxIdleMs)
   if (now > keepUntil) return { action: 'stop', reason: 'idle-limit' }

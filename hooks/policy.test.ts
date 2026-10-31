@@ -19,7 +19,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   untilMs: null,
   lastRequestAt: 0,
   lastTurnAt: 0,
-  isTurnRunning: false,
+  isRequestRunning: false,
   turnId: null,
   cacheTtl: null,
   isCompacted: false,
@@ -108,8 +108,8 @@ describe('decide', () => {
     })
   })
 
-  test('waits for a running turn', () => {
-    expect(decide(session({ isTurnRunning: true }), 56 * MIN, facts, config)).toEqual({ action: 'idle' })
+  test('waits for a running request', () => {
+    expect(decide(session({ isRequestRunning: true }), 56 * MIN, facts, config)).toEqual({ action: 'idle' })
   })
 
   test('nothing to do before the first turn', () => {

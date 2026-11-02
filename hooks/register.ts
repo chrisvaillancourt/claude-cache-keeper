@@ -457,7 +457,9 @@ export const register: Register = (on, options) => {
       probe: null,
       isRequestRunning: false,
       turnId: null,
-      lastRequestAt: now,
+      // A turn an API error ended refreshed nothing past its last good request
+      // (which its step recorded); it still counts as activity for the idle limit.
+      lastRequestAt: e.reason === 'error' ? s.lastRequestAt : now,
       lastTurnAt: now,
       pings: 0,
       pingErrors: 0,

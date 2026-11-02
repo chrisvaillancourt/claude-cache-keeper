@@ -334,6 +334,16 @@ describe('cache-keeper', () => {
     expect(w.forks.length).toBe(1)
   })
 
+  test('a turn that ended on an API error does not restart the cache clock', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(50 * MIN)
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'error' })
+    await w.clock.advance(5 * MIN) // the cache from t1 is due its ping, not one 55 minutes after the error
+    expect(w.forks.length).toBe(1)
+  })
+
   test("a turn's requests while off log off once", async ($, on) => {
     const w = world(on)
     await startAndTurn($)

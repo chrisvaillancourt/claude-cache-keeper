@@ -10,7 +10,7 @@ On Opus 5.5, one cache read costs about 1/35–1/40 as much as re-caching the sa
 - Arms a timer after each main-loop request, so the wait inside a turn counts too: a question (AskUserQuestion) or permission prompt left open while you're away, a plan waiting for approval, a long-running tool. Nothing is pinged while a request is under way.
 - Pings at `ttlMinutes − leadMinutes` (60 − 5).
 - Waits for the next turn, without pinging, after a `/model` switch or a compaction: the new model or the compacted conversation has nothing cached yet, and a fork then would miss.
-- Retries a ping that fails with an API error once, 2 minutes later (sooner if the cache would lapse first). A second error in a row stops pinging until the next turn. An error is not a miss and benches nothing.
+- Retries a ping that fails with an API error once, 2 minutes later (sooner if the cache would lapse first). A second error in a row stops pinging until the next turn. An error is not a miss and benches nothing. A request or turn that an API error ended doesn't count as a refresh, so the next ping stays timed from the last request that reached the cache.
 - Stops when:
   - the cache has already expired (e.g. the machine slept);
   - Claude Code reports a 5-minute cache TTL (it says so on a model switch or resume). Pinging every few minutes costs more than a re-cache within the hour;

@@ -34,6 +34,10 @@ const world = (
     forkResults?: ModelForkResult[]
     /** Runs while a fork is in flight, before it answers. */
     duringFork?: () => Promise<void>
+    /** The context starts with no token count (a fresh session). */
+    isFresh?: boolean
+    /** The token count comes back only once the turn completes, not when the step's hook ends. */
+    isCountLate?: boolean
   } = {},
 ) => {
   const clock = mock.clock(on, { now: T0 })
@@ -46,7 +50,14 @@ const world = (
   on('store.delete', ($, e) => storeOp(() => void store.delete(e.key)))
   on('store.keys', () => storeOp(() => [...store.keys()]))
   on('session.version', () => ({ value: { version: '2.1.292', base: '2.1.292', builtAt: '2026-10-01' } }))
-  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  // What a compaction or model switch leaves readable from any event, as a
+  // seated session (cc-plugin-sec-default) sees it with their own hooks skipped.
+  let model = 'claude-opus-5-5'
+  on('session.model', () => ({ value: model }))
+  const fullContext = opts.contextTokens ?? 200_000
+  let contextTokens: number | undefined = opts.isFresh ? undefined : fullContext
+  let messages = [...SUMMARY, ...SUMMARY]
+  on('session.messages', () => ({ value: messages }))
 
   const files = new Map<string, string>()
   on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
@@ -62,7 +73,10 @@ const world = (
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
-  on('turn.complete', () => ({ text: '' }))
+  on('turn.complete', () => {
+    if (opts.isCountLate) contextTokens = fullContext
+    return { text: '' }
+  })
   on('session.compact', () => ({ messages: SUMMARY }))
   on('classic.PostModelSwitch', () => ({}))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -70,7 +84,7 @@ const world = (
   on('session.usage', () => ({
     value: {
       startedAt: T0,
-      context: { tokens: opts.contextTokens ?? 200_000, window: 1_000_000, percent: 20 },
+      context: { tokens: contextTokens, window: 1_000_000, percent: 20 },
       rateLimits: [{ kind: 'five_hour', percentUsed: opts.percentUsed ?? 20 }],
     },
   }))
@@ -90,6 +104,8 @@ const world = (
 
   let stepUsage: ModelUsage | null = HIT
   on('turn.step', async function* ($, e) {
+    // A response gives the live window a token count again.
+    if (stepUsage !== null && !opts.isCountLate) contextTokens = fullContext
     return {
       turnId: e.turnId,
       index: e.index,
@@ -113,7 +129,27 @@ const world = (
 
   const logLines = () => (files.get(LOG) ?? '').split('\n').filter(Boolean).map(l => JSON.parse(l))
 
-  return { clock, files, forks, toasts, statuses, logLines, store, stepUsage: (u: ModelUsage | null) => (stepUsage = u) }
+  return {
+    clock,
+    files,
+    forks,
+    toasts,
+    statuses,
+    logLines,
+    store,
+    stepUsage: (u: ModelUsage | null) => (stepUsage = u),
+    /** A compaction's trace: no token count until the next response, the summary in place. */
+    compacted: () => {
+      contextTokens = undefined
+      messages = [...SUMMARY]
+    },
+    /** `/clear`'s trace: no token count and no messages. */
+    cleared: () => {
+      contextTokens = undefined
+      messages = []
+    },
+    switchModel: (to: string) => (model = to),
+  }
 }
 
 const SUMMARY = [{ role: 'user' as const, text: 'summary', toolUses: [] }]
@@ -130,6 +166,13 @@ const turn = async ($: any, turnId: string, usage?: ModelUsage) => {
     reason: 'answer',
     ...(usage ? { usage: { ...usage, model: 'claude-opus-5-5' } } : {}),
   })
+}
+
+/** A main turn with one request (the engine's usual shape), answered with HIT. */
+const turnWithStep = async ($: any, w: { stepUsage: (u: ModelUsage) => void }, turnId: string) => {
+  await $.turn.start({ text: 'hi', turnId })
+  await step($, w, turnId, 0, HIT)
+  await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId, reason: 'answer' })
 }
 
 const startAndTurn = async ($: any) => {
@@ -568,6 +611,138 @@ describe('cache-keeper', () => {
     await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
     await w.clock.advance(55 * MIN)
     expect(w.forks.length).toBe(1)
+  })
+
+  test('seated: a compaction whose hook was skipped stops pings until the next turn', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(10 * MIN)
+    w.compacted()
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+    // idle, as after the hook: not a stop for a small context
+    expect(w.logLines()).toEqual([])
+
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    await step($, w, 't2', 0, MISS)
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    await w.clock.advance(55 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('seated: no verify when the conversation compacts out of sight before the first request', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(70 * MIN)
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    w.compacted()
+    await step($, w, 't2', 0, { ...HIT, cache_read_input_tokens: 0, cache_creation_input_tokens: 30_000 })
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    expect(w.logLines().map(l => l.kind)).toEqual(['ping'])
+    expect(w.store.has('refreshVerified')).toBe(false)
+  })
+
+  test('seated: /keepwarm now after a compaction whose hook was skipped sends no fork', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    w.compacted()
+    const r = await $.command.run({ command: 'keepwarm', args: 'now', ...COMMAND })
+    expect(w.forks.length).toBe(0)
+    expect(r.text).toContain('Nothing cached')
+  })
+
+  test('seated: a model switch whose hook was skipped stops pings until the next turn, without benching', async ($, on) => {
+    const w = world(on)
+    await $.session.start({ cwd: '/x', surface: 'terminal', isInteractive: true })
+    await turnWithStep($, w, 't1')
+    await w.clock.advance(70 * MIN) // one ping at 55
+    w.switchModel('claude-sonnet-5-5')
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(1)
+
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    await step($, w, 't2', 0, MISS)
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    expect(w.logLines().some(l => l.kind === 'verify')).toBe(false)
+    expect(w.store.has('refreshFail')).toBe(false)
+    await w.clock.advance(55 * MIN)
+    expect(w.forks.length).toBe(2)
+  })
+
+  test('seated: /keepwarm now after a model switch whose hook was skipped sends no fork', async ($, on) => {
+    const w = world(on)
+    await $.session.start({ cwd: '/x', surface: 'terminal', isInteractive: true })
+    await turnWithStep($, w, 't1')
+    w.switchModel('claude-sonnet-5-5')
+    const r = await $.command.run({ command: 'keepwarm', args: 'now', ...COMMAND })
+    expect(w.forks.length).toBe(0)
+    expect(r.text).toContain('Nothing cached')
+  })
+
+  test('seated: a model switch that lands before the turn completes is still a switch', async ($, on) => {
+    const w = world(on)
+    await $.session.start({ cwd: '/x', surface: 'terminal', isInteractive: true })
+    await $.turn.start({ text: 'hi', turnId: 't1' })
+    await step($, w, 't1', 0, HIT)
+    // the switch is read before turn.complete's hook reads the model
+    w.switchModel('claude-sonnet-5-5')
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+  })
+
+  test('unseated: a compaction seen by its hook and by its trace is handled once', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    await w.clock.advance(10 * MIN)
+    await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+    w.compacted()
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+    expect(w.logLines()).toEqual([])
+
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    await step($, w, 't2', 0, MISS)
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    await w.clock.advance(55 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('unseated: a model switch seen by its hook and by the model read is handled once', async ($, on) => {
+    const w = world(on)
+    await $.session.start({ cwd: '/x', surface: 'terminal', isInteractive: true })
+    await turnWithStep($, w, 't1')
+    await w.clock.advance(70 * MIN)
+    await $.classic.PostModelSwitch(modelSwitch('1h'))
+    w.switchModel('claude-sonnet-5-5')
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(1)
+
+    await $.turn.start({ text: 'back', turnId: 't2' })
+    await step($, w, 't2', 0, MISS)
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    expect(w.logLines().some(l => l.kind === 'verify')).toBe(false)
+    // the new model is the one cached now: pings resume on it
+    await w.clock.advance(55 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'ping', outcome: 'hit' }))
+  })
+
+  test("an answered request whose token count isn't filled yet is not taken for a compaction", async ($, on) => {
+    const w = world(on, { isFresh: true, isCountLate: true })
+    await $.session.start({ cwd: '/x', surface: 'terminal', isInteractive: true })
+    await turnWithStep($, w, 't1')
+    await w.clock.advance(55 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('a context with no token count and no messages (after /clear) is not taken for a compaction', async ($, on) => {
+    const w = world(on)
+    await startAndTurn($)
+    w.cleared()
+    await w.clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+    expect(w.logLines().at(-1)).toEqual(expect.objectContaining({ kind: 'stop', reason: 'small-context' }))
   })
 
   test('small contexts are left alone', async ($, on) => {

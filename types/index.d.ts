@@ -38,6 +38,12 @@ export type Session = {
   cacheTtl: '5m' | '1h' | null
   /** Compacted since the last main-loop request: nothing cached matches the next one. */
   isCompacted: boolean
+  /**
+   * The main loop's model (`$.session.model()`) at the start of the last
+   * main-loop request; null before one. A different model now is a switch,
+   * even one whose classic.PostModelSwitch never reached this module.
+   */
+  model: string | null
   /** Pings since the last real main-loop request. */
   pings: number
   /** Ping errors in a row since the last hit or real request. */

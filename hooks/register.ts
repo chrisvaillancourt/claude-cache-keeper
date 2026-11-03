@@ -30,6 +30,7 @@ const INITIAL: Session = {
   turnId: null,
   cacheTtl: null,
   isCompacted: false,
+  model: null,
   pings: 0,
   pingErrors: 0,
   lastPing: null,
@@ -264,6 +265,60 @@ async function pruneSettings($: EngineInterface, now: number) {
 }
 
 /**
+ * Catches up on a compaction or model switch whose own hook never ran. Where
+ * Claude Code seats cc-plugin-sec-default (Team and Enterprise accounts,
+ * managed settings), session.compact and classic.* events go past this module.
+ * Both leave a trace any event can read: a compaction clears the live window's
+ * token count until its next response, and a switch changes the main loop's
+ * model. Where the hooks do run they have already recorded the same, so this
+ * changes nothing there. A window with no count and no messages is `/clear`,
+ * not a compaction, and is left to the small-context rule as before.
+ */
+async function catchUp(
+  $: EngineInterface,
+  usage: SessionUsage,
+  opts: { model?: string | null; isJustAnswered?: boolean } = {},
+): Promise<Session> {
+  const s = await read($, sessionAtom)
+  if (s.lastRequestAt === null) return s
+  // Each check on its own, so one read that fails doesn't hide the other.
+  let isCompacted = false
+  try {
+    // A request just answered re-cached the window, whether or not the engine
+    // has filled in its token count by the time this runs.
+    isCompacted =
+      !opts.isJustAnswered &&
+      !s.isCompacted &&
+      usage.context.tokens === undefined &&
+      (await $.session.messages()).length > 0
+  } catch {
+    // Best effort: the hook, where it runs, still says so.
+  }
+  const model = opts.model === undefined ? await currentModel($) : opts.model
+  const isSwitched = s.model !== null && model !== null && model !== s.model
+  if (!isCompacted && !isSwitched) return s
+  try {
+    return await update($, sessionAtom, cur => ({
+      ...cur,
+      probe: null,
+      ...(isCompacted ? { isCompacted: true } : {}),
+      ...(isSwitched ? { lastRequestAt: null } : {}),
+    }))
+  } catch {
+    return s
+  }
+}
+
+/** The main loop's model, or null when it can't be read. */
+async function currentModel($: EngineInterface) {
+  try {
+    return await $.session.model()
+  } catch {
+    return null
+  }
+}
+
+/**
  * At the start of a request of the main turn `turnId`: holds pings off, and
  * marks the request a probe when it follows a pinged break longer than the
  * TTL (between turns, or mid-turn while a tool or prompt waited). False for
@@ -271,9 +326,12 @@ async function pruneSettings($: EngineInterface, now: number) {
  */
 async function beginRequest($: EngineInterface, turnId: string): Promise<boolean> {
   try {
-    const s = await read($, sessionAtom)
-    if (s.turnId !== turnId) return false
+    if ((await read($, sessionAtom)).turnId !== turnId) return false
     cancelTimer()
+    const usage = await $.session.usage()
+    // Read once: compared by catchUp, then recorded below.
+    const model = await currentModel($)
+    const s = await catchUp($, usage, { model })
     const now = await $.clock.now()
     const isProbe =
       s.pings > 0 &&
@@ -284,12 +342,15 @@ async function beginRequest($: EngineInterface, turnId: string): Promise<boolean
       now - s.lastRequestAt < config.ttlMs
     const probe = isProbe
       ? {
-          contextTokens: (await $.session.usage()).context.tokens ?? 0,
+          contextTokens: usage.context.tokens ?? 0,
           idleMinutes: Math.round((now - (s.lastTurnAt ?? now)) / MIN),
           pings: s.pings,
         }
       : null
-    await update($, sessionAtom, cur => ({ ...cur, isRequestRunning: true, probe }))
+    // Read at the request's start, after catchUp compared it: a switch that
+    // lands while the request runs or before the turn completes is then still
+    // a switch to the next check.
+    await update($, sessionAtom, cur => ({ ...cur, isRequestRunning: true, probe, model }))
     return true
   } catch {
     // Best effort; never fail the turn over it.
@@ -318,20 +379,24 @@ async function endRequest($: EngineInterface, turnId: string, usage: ModelUsage 
         : {}),
     }))
     if (isDone && s.probe !== null) await verifyRefresh($, s.probe, usage)
-    await schedule($)
+    await schedule($, isDone)
   } catch {
     // Best effort; never fail the turn over it.
   }
 }
 
-/** Decides what the session's cache needs now and acts: wait, ping, or stop. */
-async function schedule($: EngineInterface): Promise<void> {
+/**
+ * Decides what the session's cache needs now and acts: wait, ping, or stop.
+ * `isJustAnswered`: called right after a main request was answered, so the
+ * window holds no compaction to catch up on.
+ */
+async function schedule($: EngineInterface, isJustAnswered = false): Promise<void> {
   cancelTimer()
   if (!isActive || isPinging) return
 
-  const s = await read($, sessionAtom)
-  const now = await $.clock.now()
   const usage = await $.session.usage()
+  const s = await catchUp($, usage, { isJustAnswered })
+  const now = await $.clock.now()
   const d = decide(s, now, { contextTokens: usage.context.tokens ?? 0 }, config)
 
   switch (d.action) {
@@ -516,7 +581,7 @@ export const register: Register = (on, options) => {
       case 'now': {
         // After a model switch or compaction a fork would re-write the context
         // and read as a miss, benching pings everywhere.
-        const s = await read($, sessionAtom)
+        const s = await catchUp($, await $.session.usage())
         if (s.lastRequestAt === null || s.isCompacted) {
           return { text: 'Nothing cached to keep warm yet: the next turn caches the conversation.' }
         }
